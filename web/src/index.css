@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+
+html, body, #root { height: 100%; }
+body {
+  @apply bg-base text-slate-100 font-sans antialiased;
+  /* Numbers are the product here: a projection must never shift columns
+     when it changes from 9.9 to 10.1. */
+  font-variant-numeric: tabular-nums;
+}
+
+.num { font-variant-numeric: tabular-nums; }
+
+.card { @apply bg-surface border border-line rounded-xl; }
+.chip { @apply px-2.5 py-1 rounded-full text-xs font-medium border border-line; }
+.btn  { @apply px-3 py-2 rounded-lg bg-raised border border-line text-sm
+        hover:bg-line transition-colors disabled:opacity-40; }
+.btn-primary { @apply bg-pos/15 border-pos/40 text-pos hover:bg-pos/25; }
+
+.feed { content-visibility: auto; contain-intrinsic-size: 120px; }
+
+/* Long tables scroll inside their own container; the page body never scrolls sideways. */
+.scroll-x { @apply overflow-x-auto; -webkit-overflow-scrolling: touch; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

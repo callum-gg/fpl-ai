@@ -1,0 +1,42 @@
+services:
+  api:
+    build: ./api
+    env_file:
+      - path: .env
+        required: false   # every key is optional; sources self-disable without one
+    environment:
+      DATA_DIR: /app/data
+      DATABASE_URL: sqlite:////app/data/fplai.db
+    volumes:
+      - ./data:/app/data
+      - ./api/src:/app/src
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE: ""
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${WEB_PORT:-5173}:80"
+    depends_on: [api]
+    restart: unless-stopped
+
+  # Optional local LLM. `docker compose --profile ollama up -d` to enable.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [ollama]
+    volumes:
+      - ./data/ollama:/root/.ollama
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
