@@ -10,8 +10,8 @@ from __future__ import annotations
 import logging
 
 from ..db.engine import jdump, query, query_one, utcnow, writer
-from ..defaults import normalise_position
 from ..db.settings_store import global_settings
+from ..defaults import normalise_position
 from ..features.build import build_ctx, deadline_of
 from ..features.registry import compute_all
 from . import bonus as bonus_mod

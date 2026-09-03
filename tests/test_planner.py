@@ -247,3 +247,29 @@ def test_identical_plans_are_marked_rather_than_shown_as_three_choices():
     assert _matching_variant(_payload(fifteen, xi, 5, chip="wildcard"), [safe]) is None
     # Nothing to compare against yet.
     assert _matching_variant(balanced, []) is None
+
+
+def test_the_plan_says_when_it_is_flying_without_the_market(seeded_season, player_pool):
+    """GW1-2 were planned on the team model alone while a working odds key sat in the .env
+    and the poll job had never run. The blend disengaging must not be silent."""
+    from fplai.db.engine import query_one, writer
+    from fplai.optimiser.recommend import _data_warnings
+
+    def warnings():
+        return " ".join(_data_warnings(seeded_season, 1, []))
+
+    assert "No match odds" in warnings()
+
+    fixture = query_one("SELECT id FROM fixtures WHERE season_id=? AND gameweek=1", (seeded_season,))
+    if fixture is None:
+        return                      # the seeded season has no GW1 fixture to attach odds to
+    with writer() as conn:
+        conn.execute(
+            "INSERT INTO odds_snapshots(fixture_id,source_id,bookmaker,market,selection,"
+            "price_decimal,implied_prob,observed_at) "
+            "VALUES(?,'odds_api','test','h2h','home',2.0,0.5,?)",
+            (fixture["id"], "2020-01-01T00:00:00+00:00"),
+        )
+    stale = warnings()
+    assert "No match odds" not in stale
+    assert "old" in stale and "odds" in stale.lower()

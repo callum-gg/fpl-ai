@@ -614,6 +614,11 @@ def _payload(plan, pruned, first_gw, ctx, settings, season_id, gameweek, baselin
 # news cycle behind FPL's own flags.
 STALE_AVAILABILITY_HOURS = 12.0
 
+# Odds drift steadily and then sharply once team news lands, so a day-old price is a
+# different market. Wider than the availability window because a stale price still beats
+# no price — the team model alone is the worse of the two.
+STALE_ODDS_HOURS = 24.0
+
 
 def _hours_since(ts: str | None) -> float | None:
     if not ts:
@@ -649,6 +654,26 @@ def _data_warnings(season_id: str, gameweek: int, xi: list[int]) -> list[str]:
             f"FPL injury flags are {age:.0f}h old (last synced {avail_at}). "
             "Re-run the bootstrap sync before trusting this XI."
         )
+
+    # The market is a better forecaster of goals than the team model, and the blend simply
+    # disengages when there are no odds — quietly, with every number still rendering. That
+    # is how GW1-2 were planned on the team model alone while a working odds key sat in the
+    # .env and the poll job had never once been run.
+    odds = query_one(
+        "SELECT MAX(observed_at) t FROM odds_snapshots o JOIN fixtures f ON f.id=o.fixture_id "
+        "WHERE f.season_id=? AND f.gameweek=?",
+        (season_id, gameweek),
+    )
+    odds_at = odds["t"] if odds else None
+    odds_age = _hours_since(odds_at)
+    if odds_age is None:
+        out.append(
+            "No match odds for this gameweek — expected goals come from the team model "
+            "alone and the market blend is disengaged. Run the odds_poll job."
+        )
+    elif odds_age > STALE_ODDS_HOURS:
+        out.append(f"Match odds are {odds_age:.0f}h old (last polled {odds_at}) — prices "
+                   "move most in the 24h before a deadline.")
 
     pred = query_one(
         "SELECT MAX(generated_at) t FROM predictions WHERE season_id=? AND gameweek=?",

@@ -91,7 +91,9 @@ class OddsApiConnector(Connector):
     requires_keys = ["odds_api_key"]
     default_cadence = "0 */4 * * *"
     rate_limit_per_min = 5
-    parser_version = 1
+    # 2: fixture matching canonicalises both sides, so the promoted clubs resolve. Bumping
+    # this reparses the archive in place — no refetch, no extra API credits spent.
+    parser_version = 2
 
     async def fetch(self, ctx: IngestContext) -> AsyncIterator[RawDoc]:
         s = ctx.settings
@@ -156,18 +158,39 @@ def _selection_label(market_key: str, outcome: dict, ev: dict) -> str:
     return name
 
 
+def _same_club(name: str | None, short: str | None, key: str) -> bool:
+    """Does this fixture's team row mean the same club as the odds feed's resolved key?"""
+    if key in (name, short):
+        return True
+    return resolve_team(name) == key or (bool(short) and resolve_team(short) == key)
+
+
 def _match_fixture(home: str | None, away: str | None, kickoff: str | None) -> int | None:
-    hk, ak = resolve_team(home), resolve_team(away)
-    if not hk or not ak or not kickoff:
+    """Match on canonical club identity, not on whichever string each side happens to use.
+
+    Comparing the feed's *resolved* key straight against `teams.name`/`short_name` drops
+    any fixture whose stored name and canonical alias disagree — which for 2026-27 was
+    exactly the three promoted clubs ("Ipswich Town" in `teams`, "Ipswich" as the canonical
+    key), so three of every ten fixtures went unpriced and their players silently fell back
+    to the team model while everyone else got the market.
+    """
+    if not home or not away or not kickoff:
         return None
-    row = query_one(
-        "SELECT f.id FROM fixtures f "
-        "JOIN teams th ON th.id=f.home_team_id JOIN teams ta ON ta.id=f.away_team_id "
-        "WHERE (th.name=? OR th.short_name=?) AND (ta.name=? OR ta.short_name=?) "
-        "AND substr(f.kickoff_utc,1,10)=substr(?,1,10) LIMIT 1",
-        (hk, hk, ak, ak, kickoff),
-    )
-    return row["id"] if row else None
+    # An unknown alias must not be fatal. Resolution failing used to return None for the
+    # whole fixture, so one unrecognised club name cost both sides their market — falling
+    # back to the surface form still matches against `teams.name` directly.
+    hk = resolve_team(home) or home
+    ak = resolve_team(away) or away
+    for r in query(
+        "SELECT f.id, th.name hn, th.short_name hs, ta.name an, ta.short_name a_s "
+        "FROM fixtures f JOIN teams th ON th.id=f.home_team_id "
+        "JOIN teams ta ON ta.id=f.away_team_id "
+        "WHERE substr(f.kickoff_utc,1,10)=substr(?,1,10)",
+        (kickoff,),
+    ):
+        if _same_club(r["hn"], r["hs"], hk) and _same_club(r["an"], r["a_s"], ak):
+            return r["id"]
+    return None
 
 
 def team_lambdas(fixture_id: int) -> tuple[float, float] | None:

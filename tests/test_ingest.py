@@ -359,3 +359,46 @@ def test_an_archive_only_connector_writing_no_rows_is_normal(seeded_season):
             yield RawDoc("article", "a story worth keeping", url="http://x/archive-only")
 
     assert asyncio.run(run_connector(ArchiveOnly(), seeded_season)).status == "ok"
+
+
+def test_odds_match_fixtures_by_club_identity_not_by_stored_string(seeded_season):
+    """The feed says "Ipswich Town", the canonical alias is "Ipswich", and `teams.name`
+    says "Ipswich Town" — comparing the resolved key straight against the stored string
+    dropped exactly the promoted clubs, leaving 3 of every 10 fixtures unpriced.
+
+    Uses an invented club so the divergence is controlled here rather than inherited from
+    whatever the alias seed happens to contain.
+    """
+    from fplai.connectors.odds_api import _match_fixture, _same_club
+    from fplai.db.engine import query_one, writer
+    from fplai.resolve.entities import resolve_team
+
+    with writer() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO team_aliases(team_key,alias_norm,origin) "
+            "VALUES('Testford','testford united','test')"
+        )
+        for fpl_id, name, short in ((90, "Testford United", "TFD"), (91, "Otherton", "OTH")):
+            conn.execute(
+                "INSERT OR IGNORE INTO teams(season_id,fpl_team_id,name,short_name) "
+                "VALUES(?,?,?,?)", (seeded_season, fpl_id, name, short),
+            )
+        home = query_one("SELECT id FROM teams WHERE name='Testford United'")["id"]
+        away = query_one("SELECT id FROM teams WHERE name='Otherton'")["id"]
+        conn.execute(
+            "INSERT OR IGNORE INTO fixtures(season_id,fpl_fixture_id,gameweek,kickoff_utc,"
+            "home_team_id,away_team_id,finished) "
+            "VALUES(?,8801,9,'2026-09-04T19:00:00+00:00',?,?,0)",
+            (seeded_season, home, away),
+        )
+
+    # The canonical key differs from what `teams` stores. That divergence is the whole bug.
+    canonical = resolve_team("Testford United")
+    assert canonical == "Testford" and canonical != "Testford United"
+    assert _same_club("Testford United", "TFD", "Testford")
+
+    # Home resolves through the alias, away has no alias at all and falls back to its
+    # surface form — one unknown club must not cost both sides their market.
+    assert _match_fixture("Testford United", "Otherton", "2026-09-04T19:00:00Z") is not None
+    assert _match_fixture("Nowhere FC", "Otherton", "2026-09-04T19:00:00Z") is None
+    assert _match_fixture("Testford United", "Otherton", "2026-12-25T19:00:00Z") is None
