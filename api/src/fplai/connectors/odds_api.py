@@ -10,6 +10,8 @@ import logging
 import math
 from collections.abc import AsyncIterator
 
+from functools import lru_cache
+
 from ..db.engine import query, query_one
 from ..resolve.entities import resolve_team
 from .base import Connector, IngestContext, ParsedBatch, RawDoc, fetch_url, utcnow
@@ -139,6 +141,9 @@ class OddsApiConnector(Connector):
                                  o["price"], ip, fp, observed),
                             )
                             n += 1
+            # New prices land, so the fixture-level caches below must not keep serving the
+            # old ones to a long-lived API process.
+            refresh()
             return n
 
         b.defer(_odds)
@@ -193,8 +198,16 @@ def _match_fixture(home: str | None, away: str | None, kickoff: str | None) -> i
     return None
 
 
+@lru_cache(maxsize=512)
 def team_lambdas(fixture_id: int) -> tuple[float, float] | None:
-    """Latest devigged market view of a fixture as (lambda_home, lambda_away)."""
+    """Latest devigged market view of a fixture as (lambda_home, lambda_away).
+
+    Cached because this is a property of the fixture but `_odds()` asks for it once per
+    *player* — about 65 times per fixture, each time running two correlated subqueries
+    over odds_snapshots. Uncached, that alone took a gameweek feature build from 10
+    seconds to five minutes the moment odds existed. `refresh()` clears it after an
+    ingest so a long-lived process never serves a stale price.
+    """
     rows = query(
         "SELECT selection, AVG(devig_prob) p FROM odds_snapshots WHERE fixture_id=? AND market='h2h'"
         " AND observed_at=(SELECT MAX(observed_at) FROM odds_snapshots WHERE fixture_id=?"
@@ -214,6 +227,7 @@ def team_lambdas(fixture_id: int) -> tuple[float, float] | None:
     )
 
 
+@lru_cache(maxsize=512)
 def odds_movement(fixture_id: int, hours: int = 48) -> float:
     """Drift in the home team's devigged win probability. Steam is information."""
     rows = query(
@@ -225,3 +239,9 @@ def odds_movement(fixture_id: int, hours: int = 48) -> float:
     if len(rows) < 2:
         return 0.0
     return float(rows[-1]["p"] - rows[0]["p"])
+
+
+def refresh() -> None:
+    """Drop the fixture-level odds caches. Called after an ingest writes new prices."""
+    team_lambdas.cache_clear()
+    odds_movement.cache_clear()

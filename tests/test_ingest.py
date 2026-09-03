@@ -402,3 +402,17 @@ def test_odds_match_fixtures_by_club_identity_not_by_stored_string(seeded_season
     assert _match_fixture("Testford United", "Otherton", "2026-09-04T19:00:00Z") is not None
     assert _match_fixture("Nowhere FC", "Otherton", "2026-09-04T19:00:00Z") is None
     assert _match_fixture("Testford United", "Otherton", "2026-12-25T19:00:00Z") is None
+
+
+def test_fixture_level_odds_are_cached_but_not_stale(seeded_season):
+    """`_odds()` asks for these once per *player*, ~65 times a fixture, each running two
+    correlated subqueries — uncached that took a feature build from 10s to 5 minutes the
+    moment odds existed. Cached, an ingest must still invalidate them."""
+    from fplai.connectors.odds_api import odds_movement, refresh, team_lambdas
+
+    assert hasattr(team_lambdas, "cache_clear") and hasattr(odds_movement, "cache_clear")
+    team_lambdas(999999)
+    assert team_lambdas.cache_info().currsize >= 1
+    refresh()
+    assert team_lambdas.cache_info().currsize == 0
+    assert odds_movement.cache_info().currsize == 0
