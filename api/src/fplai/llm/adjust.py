@@ -27,6 +27,27 @@ log = logging.getLogger(__name__)
 TIER1_TRUST = 1.5
 RECENT_HOURS = 36
 
+# Claim types this layer will act on. The extractor's vocabulary is wider than this on
+# purpose — the test is whether a claim carries *availability or role* information that no
+# feature can already see:
+#   in   injury / return / rotation / role_change / penalty_duty — availability and role
+#   in   manager_quote — the pre-deadline press conference, which is exactly the "too new
+#        for any feature" case this layer exists for, and was the single biggest omission:
+#        it is 43 of the 267 claims held, and adding it takes the layer from 2 players it
+#        could ever fire on to 6
+#   out  form — already modelled properly by xg90/xa90/bps90; adjusting on it double-counts
+#   out  recommendation / captain_pick / avoid — pundit opinion, not information. Beating
+#        those is the point of the model; feeding them back in is circular
+#   out  transfer_rumour — mostly about players who then stay, and the deadline-day cases
+#        arrive as `rotation` anyway
+ADJUSTABLE_CLAIM_TYPES = (
+    "injury", "return", "rotation", "role_change", "penalty_duty", "manager_quote",
+)
+
+# Fallback direction when the extractor returned no sentiment, for the types whose name
+# already carries one. Everything else abstains rather than guessing.
+DEFAULT_SENTIMENT = {"injury": -0.5, "rotation": -0.5, "return": 0.3, "penalty_duty": 0.3}
+
 
 def _cap(base: float, settings: dict) -> float:
     max_abs = float(settings.get("adjustment.max_points", 2.0))
@@ -37,16 +58,22 @@ def _cap(base: float, settings: dict) -> float:
 def recent_claims(player_id: int, since_hours: int = RECENT_HOURS) -> list[dict]:
     """Near-dupe-collapsed: one row per semantic group, so six syndicated copies of one
     story count once."""
+    placeholders = ",".join("?" * len(ADJUSTABLE_CLAIM_TYPES))
     rows = query(
-        "SELECT c.*, ch.trust_weight, rd.source_id, "
+        # Trust comes from the channel for a video and from the source otherwise. The
+        # channel join alone left every RSS, Reddit and Bluesky claim on a NULL weight,
+        # so `TIER1_TRUST` was unreachable for anything that was not a YouTube video —
+        # and `sources.trust_weight` is the column the admin UI already edits.
+        "SELECT c.*, COALESCE(ch.trust_weight, s.trust_weight) trust_weight, rd.source_id, "
         "COALESCE(c.semantic_group, c.id) grp "
         "FROM claims c JOIN raw_documents rd ON rd.id=c.raw_doc_id "
+        "LEFT JOIN sources s ON s.id=rd.source_id "
         "LEFT JOIN videos v ON v.raw_doc_id=c.raw_doc_id "
         "LEFT JOIN channels ch ON ch.channel_id=v.channel_id "
         "WHERE c.player_id=? AND c.extracted_at > datetime('now', ?) "
-        "AND c.claim_type IN ('injury','return','rotation','role_change') "
+        f"AND c.claim_type IN ({placeholders}) "
         "ORDER BY c.extracted_at DESC",
-        (player_id, f"-{since_hours} hour"),
+        (player_id, f"-{since_hours} hour", *ADJUSTABLE_CLAIM_TYPES),
     )
     seen: set[int] = set()
     out = []
@@ -85,7 +112,12 @@ def compute_adjustment(player_id: int, base_exp_points: float) -> tuple[float, s
             w *= 0.8
         sentiment = c.get("sentiment")
         if sentiment is None:
-            sentiment = -0.5 if c["claim_type"] in ("injury", "rotation") else 0.3
+            # Only a type whose *name* already states a direction gets a default. A manager
+            # quote or a role change with no extracted sentiment says nothing either way,
+            # and the old blanket +0.3 manufactured a positive signal out of silence.
+            sentiment = DEFAULT_SENTIMENT.get(c["claim_type"])
+            if sentiment is None:
+                continue
         signal += w * float(sentiment)
         total_weight += w
 

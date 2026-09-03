@@ -486,7 +486,36 @@ async def run_connector(
                         "UPDATE raw_documents SET parse_status='failed', parse_error=? WHERE id=?",
                         (str(e)[:500], doc_id),
                     )
-        record_success(connector.id)
+        # Two ways a run can be a silent no-op, and both used to record a clean `ok`.
+        #
+        # `understat`, `fbref` and `setpieces` each logged success with zero requests, zero
+        # documents and zero rows, so every dashboard read healthy while 2026-27 got no xG,
+        # no shot volumes and no set-piece duties at all — those features sat flat at zero
+        # in the store for a fortnight and nothing anywhere said why. Then `understat`
+        # showed the subtler variant: it fetched its page fine and parsed it into nothing.
+        #
+        # A connector that overrides `parse` exists to write normalised rows; one that does
+        # not is an archive-only feed (rss_news, transcripts) whose normal day is zero rows.
+        parses_rows = type(connector).parse is not Connector.parse
+        empty_reason = None
+        if result.requests_made == 0:
+            empty_reason = "fetched nothing — the source may have moved or expired"
+        elif parses_rows and result.docs_new and not result.rows_upserted:
+            empty_reason = (f"fetched {result.docs_new} new document(s) and parsed 0 rows "
+                            f"— the feed's shape has probably changed")
+
+        if empty_reason:
+            # Deliberately does not reset the failure counter: a source quietly returning
+            # nothing must still trip FAILURE_LIMIT rather than look healthy forever.
+            result.status = "empty"
+            log.warning("connector %s %s", connector.id, empty_reason)
+            if record_failure(connector.id) >= FAILURE_LIMIT:
+                from ..notify.discord import notify
+
+                await notify(f"⚠️ Source `{connector.id}` has produced nothing "
+                             f"{FAILURE_LIMIT} times running.")
+        else:
+            record_success(connector.id)
     except Exception as e:
         log.exception("connector %s failed", connector.id)
         result.status = "failed"

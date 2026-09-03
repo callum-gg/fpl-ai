@@ -1,8 +1,12 @@
 /** The remaining screens from docs/10: squad, comparison, planner, ticker, feed,
  *  model performance, chat and settings. Grouped because each is compact. */
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   api,
+  ALL_PLAYERS,
+  CHIP_LABELS,
+  CHIPS,
+  matchesName,
   money,
   pts,
   useBacktests,
@@ -29,6 +33,8 @@ import {
   useTicker,
   useVerifyKeys,
   useWhatIf,
+  type ChipUse,
+  type Draft,
 } from "../lib/api";
 import { useSquadStore } from "../stores/squad";
 import {
@@ -187,6 +193,15 @@ export function SquadView() {
             {rows.map((p: any) => (
               <PlayerRow key={p.player_id} player={p}>
                 {editing && (
+                  <PriceCell
+                    paid={p.purchase_price}
+                    busy={busy}
+                    onSet={(tenths) =>
+                      editDraft.mutate({ prices: { [p.player_id]: tenths } })
+                    }
+                  />
+                )}
+                {editing && (
                   <button
                     className="chip text-muted hover:text-neg"
                     title="Remove from working copy"
@@ -215,13 +230,16 @@ export function SquadView() {
           {!draft ? (
             <button
               className="btn"
-              disabled={busy || !state}
+              disabled={busy}
+              // No set squad is the case that needs this most, not the one to refuse:
+              // a disconnected app starts from an empty fifteen and you type in the truth.
+              title={state ? "Copy your set squad" : "Build a squad from scratch"}
               onClick={async () => {
                 await seedDraft.mutateAsync({});
                 setView("working");
               }}
             >
-              Start working copy
+              {state ? "Start working copy" : "Build squad by hand"}
             </button>
           ) : (
             <>
@@ -258,6 +276,11 @@ export function SquadView() {
         </div>
       </Card>
 
+      {/* Only alongside the copy it edits — these numbers mean nothing next to the set squad. */}
+      {editing && (
+        <ManualOverrides draft={draft} busy={busy} onApply={(body) => editDraft.mutate(body)} />
+      )}
+
       <AddPlayerSheet
         open={addOpen}
         onClose={() => setAddOpen(false)}
@@ -273,7 +296,187 @@ export function SquadView() {
   );
 }
 
-/** Position-filtered player list for building a working copy by hand. */
+/** Everything about a squad that is a number rather than a player.
+ *
+ * `Sync from FPL` is a guess at what FPL holds, and when it is wrong there is no argument
+ * to be had with it — a stale free-transfer count silently poisons every hit the planner
+ * prices, a chip it thinks you still hold gets planned into a gameweek you cannot use it,
+ * and neither shows up as an error. So each of those is typed in directly, and FPL stays
+ * the source of truth even when the sync is not. Nothing here touches your set squad until
+ * you commit the working copy. */
+function ManualOverrides({
+  draft,
+  busy,
+  onApply,
+}: {
+  draft?: Draft;
+  busy: boolean;
+  onApply: (body: {
+    gameweek?: number;
+    bank?: number;
+    free_transfers?: number;
+    chips_used?: ChipUse[];
+    chip_active?: string;
+  }) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState<Record<string, string>>({});
+
+  // Re-read from the draft whenever it changes underneath us (a commit, a discard, a
+  // sync), so the boxes never show a value the server has already moved past.
+  const serverForm = useMemo<Record<string, string>>(() => {
+    if (!draft) return {};
+    const used: ChipUse[] = draft.chips_used_json ? JSON.parse(draft.chips_used_json) : [];
+    const chips = Object.fromEntries(
+      CHIPS.map((c) => [c, String(used.find((u) => u.name === c)?.gameweek ?? "")]),
+    );
+    return {
+      gameweek: String(draft.gameweek),
+      bank: (draft.bank / 10).toFixed(1),
+      free_transfers: String(draft.free_transfers),
+      chip_active: draft.chip_active ?? "",
+      ...chips,
+    };
+  }, [draft]);
+
+  useEffect(() => setForm(serverForm), [serverForm]);
+
+  if (!draft) return null;
+  const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const dirty = CHIPS.concat(["gameweek", "bank", "free_transfers", "chip_active"] as any).some(
+    (k) => (form[k] ?? "") !== (serverForm[k] ?? ""),
+  );
+
+  function apply() {
+    onApply({
+      gameweek: Number(form.gameweek) || undefined,
+      bank: Math.round(Number(form.bank) * 10),
+      free_transfers: Number(form.free_transfers),
+      chip_active: form.chip_active,   // "" clears it; the field is always sent
+      chips_used: CHIPS.filter((c) => form[c] !== "").map((c) => ({
+        name: c,
+        gameweek: Number(form[c]),
+      })),
+    });
+  }
+
+  return (
+    <Card
+      title="Manual overrides"
+      actions={
+        <button className="btn" onClick={() => setOpen((o) => !o)}>
+          {open ? "Hide" : "Edit"}
+        </button>
+      }
+    >
+      {!open ? (
+        <p className="text-sm text-muted">
+          Bank, free transfers, gameweek and chips — set them by hand when the sync and FPL
+          have drifted apart.
+        </p>
+      ) : (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <Field label="Gameweek">
+              <input className={INPUT} inputMode="numeric" value={form.gameweek ?? ""}
+                onChange={(e) => set("gameweek", e.target.value)} />
+            </Field>
+            <Field label="Bank £m">
+              <input className={INPUT} inputMode="decimal" value={form.bank ?? ""}
+                onChange={(e) => set("bank", e.target.value)} />
+            </Field>
+            <Field label="Free transfers">
+              <input className={INPUT} inputMode="numeric" value={form.free_transfers ?? ""}
+                onChange={(e) => set("free_transfers", e.target.value)} />
+            </Field>
+            <Field label="Chip this GW">
+              <select className={INPUT} value={form.chip_active ?? ""}
+                onChange={(e) => set("chip_active", e.target.value)}>
+                <option value="">None</option>
+                {CHIPS.map((c) => (
+                  <option key={c} value={c}>{CHIP_LABELS[c]}</option>
+                ))}
+              </select>
+            </Field>
+          </div>
+
+          <div>
+            <p className="text-muted text-xs uppercase mb-2">
+              Chips already played — the gameweek, or blank if still held
+            </p>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {CHIPS.map((c) => (
+                <Field key={c} label={CHIP_LABELS[c]}>
+                  <input className={INPUT} inputMode="numeric" placeholder="unused"
+                    value={form[c] ?? ""} onChange={(e) => set(c, e.target.value)} />
+                </Field>
+              ))}
+            </div>
+          </div>
+
+          <button className="btn btn-primary" disabled={busy || !dirty} onClick={apply}>
+            {busy ? "Saving…" : "Apply to working copy"}
+          </button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** What you paid for one player, editable in place.
+ *
+ * Adding a player prices him at today's value, which is right for a new signing and wrong
+ * for every player you already held — you keep only half of any rise, so a squad rebuilt at
+ * today's prices reports a selling value you cannot actually realise. Committed on blur,
+ * because a PATCH per keystroke would fight the cursor. */
+function PriceCell({
+  paid,
+  busy,
+  onSet,
+}: {
+  paid: number | null;
+  busy: boolean;
+  onSet: (tenths: number) => void;
+}) {
+  const asText = paid == null ? "" : (paid / 10).toFixed(1);
+  const [text, setText] = useState(asText);
+  useEffect(() => setText(asText), [asText]);
+
+  return (
+    <input
+      className="bg-raised border border-line rounded px-2 py-1 text-xs w-16 num text-right"
+      inputMode="decimal"
+      title="Purchase price — what you actually paid"
+      disabled={busy}
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={() => {
+        const tenths = Math.round(Number(text) * 10);
+        if (text !== asText && tenths > 0) onSet(tenths);
+        else setText(asText);
+      }}
+    />
+  );
+}
+
+const INPUT = "bg-raised border border-line rounded-lg px-3 py-2 text-sm w-full";
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="text-muted text-xs uppercase block mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+/** Searchable, whole-league player list for building a working copy by hand.
+ *
+ * It used to open on MID and ask for 40 rows, which is a top-40 leaderboard wearing a
+ * player picker's clothes: the enabler you actually wanted was never on it, and there was
+ * no position for "all". A hand-built squad needs every player reachable, so the list is
+ * the league and the search box is how you get through it — same client-side filter the
+ * explorer screen uses, over the same 600-row fetch. */
 function AddPlayerSheet({
   open,
   onClose,
@@ -285,27 +488,45 @@ function AddPlayerSheet({
   owned: number[];
   onPick: (playerId: number) => void;
 }) {
-  const [position, setPosition] = useState<string>("MID");
-  const { data: players, isLoading } = usePlayers({ position, limit: 40 });
+  const [position, setPosition] = useState<string>("");
+  const [term, setTerm] = useState("");
+  const { data: players, isLoading } = usePlayers({
+    position: position || undefined,
+    limit: ALL_PLAYERS,
+  });
+
+  const rows = useMemo(
+    () => (players ?? []).filter((p) => matchesName(p, term)),
+    [players, term],
+  );
 
   return (
     <Sheet open={open} onClose={onClose} title="Add player">
+      <input
+        className="bg-raised border border-line rounded-lg px-3 py-2 text-sm w-full mb-3"
+        placeholder="Search name"
+        value={term}
+        onChange={(e) => setTerm(e.target.value)}
+        autoFocus
+      />
       <div className="flex gap-2 mb-3">
-        {["GK", "DEF", "MID", "FWD"].map((p) => (
+        {["", "GK", "DEF", "MID", "FWD"].map((p) => (
           <button
-            key={p}
+            key={p || "all"}
             className={`chip ${p === position ? "bg-pos/15 border-pos/40 text-pos" : "text-muted"}`}
             onClick={() => setPosition(p)}
           >
-            {p}
+            {p || "All"}
           </button>
         ))}
       </div>
       {isLoading ? (
         <Loading />
+      ) : rows.length === 0 ? (
+        <Empty title={term ? `No player matches "${term}"` : "No players"} />
       ) : (
         <ul className="divide-y divide-line max-h-96 overflow-y-auto">
-          {(players ?? []).map((p: any) => (
+          {rows.map((p) => (
             <PlayerRow key={p.id} player={p}>
               <button
                 className="chip"

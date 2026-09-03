@@ -120,12 +120,23 @@ def nb_survival(mu: float, k: float, threshold: int) -> float:
     return max(0.0, min(1.0, 1.0 - cdf))
 
 
-def nb_sample(rng: np.random.Generator, mu: float, k: float, size: int) -> np.ndarray:
-    """Gamma-Poisson mixture, which is what a negative binomial is."""
-    if mu <= 0:
-        return np.zeros(size, dtype=int)
-    lam = rng.gamma(shape=k, scale=mu / k, size=size)
-    return rng.poisson(lam)
+def nb_sample(rng: np.random.Generator, mu, k: float, size: int) -> np.ndarray:
+    """Gamma-Poisson mixture, which is what a negative binomial is.
+
+    `mu` may be a scalar or one rate per draw. Per draw matters: a player whose minutes
+    vary across simulations has a different rate in each, and P(X >= threshold) is convex
+    in mu over the DefCon range, so collapsing the vector to its mean under-states the
+    threshold probability — measured 1.07x for a nailed starter and 2.55x for a rotation
+    risk, which is most of why expected DefCon came in at half the observed rate.
+    """
+    mu = np.asarray(mu, dtype=float)
+    if mu.ndim == 0:
+        mu = np.full(size, float(mu))
+    out = np.zeros(size, dtype=int)
+    live = mu > 0
+    if live.any():
+        out[live] = rng.poisson(rng.gamma(shape=k, scale=mu[live] / k))
+    return out
 
 
 def fit_dispersion(counts: np.ndarray, means: np.ndarray) -> float:

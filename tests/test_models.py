@@ -184,6 +184,46 @@ def test_between_seasons_bypasses_the_trained_minutes_model():
     assert predict(_Doubtful(), preseason).p_start > 0.8
 
 
+def test_an_unused_substitute_is_not_the_close_season():
+    """GW1 bench-warmers were being handed the pre-season prior, which is price-led.
+
+    A striker left out of the opening weekend has zero minutes in 14 days and a last
+    appearance back in May, which is indistinguishable from July if you only read his own
+    row. The guard then skipped the model for the one player it had just learned the most
+    about, and a 25%-start forward came back priced as nailed. `days_since_team_match` is
+    what tells the two apart: his club played on Saturday.
+    """
+    from fplai.models.minutes import _between_seasons, predict
+
+    idle = {"starts_last5": 3, "mins_last10": 689, "days_since_last_match": 96,
+            "price_rank_in_position": 0.96, "player_minutes_last_14_days": 0}
+    assert _between_seasons(idle)                                   # no team signal: unchanged
+    assert _between_seasons(dict(idle, days_since_team_match=96))    # genuine close season
+    assert not _between_seasons(dict(idle, days_since_team_match=6))  # his club played
+
+    class _Benched:
+        def predict_one(self, _features):
+            return np.array([0.69, 0.15, 0.16])
+
+    benched = dict(idle, days_since_team_match=6)
+    assert predict(_Benched(), benched).p_start == pytest.approx(0.16)
+    assert predict(_Benched(), idle).p_start > 0.6
+
+
+def test_a_source_with_no_verdict_does_not_vote():
+    """Scrapers list a player before they know anything, as `unknown` with no percentage.
+
+    Scored as 0.7 that was a vote for mild doubt on a fit player, and it also made him
+    disagree with the sources that did know — and disagreement *widens* the minutes
+    distribution. Two fabricated signals from one empty row.
+    """
+    from fplai.features.builders import _avail_score
+
+    assert _avail_score({"status": "unknown", "chance_pct": None}) is None
+    assert _avail_score({"status": "available", "chance_pct": None}) == 1.0
+    assert _avail_score({"status": "doubt", "chance_pct": 25}) == 0.25
+
+
 def test_date_only_timestamps_stay_comparable_with_aware_ones():
     """`players.birth_date` is a plain date, everything else carries an offset.
 
@@ -256,6 +296,31 @@ def test_defcon_threshold_probability_is_monotonic_in_rate():
     assert 0 <= probs[0] < probs[-1] <= 1
     assert nb_survival(0, 5, 10) == 0.0
     assert nb_survival(10, 5, 0) == 1.0
+
+
+def test_nb_sample_uses_one_rate_per_draw_not_their_mean():
+    """The rotation-risk case: he plays 90 or he plays nothing, and only the 90s score.
+
+    Sampling at mean(mu) instead of per-draw mu under-stated expected DefCon by roughly
+    half across GW1-2. P(X >= threshold) is convex in mu here, so the two are not
+    interchangeable and the gap widens as start probability falls.
+    """
+    from fplai.models.rates import nb_sample
+
+    rng = np.random.default_rng(0)
+    n, k, threshold = 40000, 5.0, 10
+    # 60% of draws at a full 90 minutes' rate, 40% at zero — mean 5.1, but the mass that
+    # clears 10 actions lives entirely in the 8.5 half.
+    mu = np.where(rng.random(n) < 0.6, 8.5, 0.0)
+
+    per_draw = nb_sample(rng, mu, k, n)
+    collapsed = nb_sample(rng, float(mu.mean()), k, n) * (mu > 0)
+
+    assert (per_draw >= threshold).mean() > 1.5 * (collapsed >= threshold).mean()
+    assert per_draw[mu == 0].max() == 0          # no actions without minutes
+    # A scalar rate must still behave, since that is the whole API for a fixed-minutes call.
+    assert nb_sample(rng, 0.0, k, 50).sum() == 0
+    assert nb_sample(rng, 6.0, k, 500).mean() == pytest.approx(6.0, rel=0.25)
 
 
 def test_defcon_threshold_is_position_dependent():
@@ -620,3 +685,353 @@ def test_forcing_a_player_into_an_initial_build_includes_him():
                       force_in=[worst.player_id])
     plan = _initial_squad_plan({1: cands}, ctx, RiskProfile(), 1)
     assert worst.player_id in plan.gameweeks[0].squad
+
+
+# ══ promotion gate ═══════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def _no_incumbent(monkeypatch):
+    """`_should_promote` with a controllable incumbent row and auto-promote forced on."""
+    from fplai.models import base
+
+    state: dict = {"incumbent": None}
+
+    def fake_query_one(sql, params=()):
+        return state["incumbent"]
+
+    monkeypatch.setattr(base, "query_one", fake_query_one)
+
+    class _S:
+        model_auto_promote = True
+
+    monkeypatch.setattr(base, "get_settings", lambda: _S())
+    return state
+
+
+def _incumbent(**metrics):
+    import json as _json
+
+    return {"metrics_json": _json.dumps(metrics)}
+
+
+def test_cold_start_promotes_but_an_unmeasured_challenger_never_does(_no_incumbent):
+    """The 27 Aug saves90 bug: no MAE on the run, promoted over a measured incumbent."""
+    from fplai.models.base import _should_promote
+
+    assert _should_promote("saves90", {"train_rows": 100})           # nothing to beat yet
+
+    _no_incumbent["incumbent"] = _incumbent(mae=1.32, holdout="2025-26:GW34-2025-26:GW38")
+    assert not _should_promote("saves90", {"train_rows": 100})       # unmeasured: refuse
+    assert not _should_promote("saves90", {"importance": {}})
+
+
+def test_promotion_prefers_a_head_to_head_on_the_same_holdout(_no_incumbent):
+    """Both models answering the same question is the only comparison worth acting on."""
+    from fplai.models.base import _should_promote
+
+    # The incumbent's *stored* score is flattering — it came from an easier window.
+    _no_incumbent["incumbent"] = _incumbent(log_loss=0.43, holdout="2025-26:GW34-2025-26:GW38")
+
+    # Scored side by side on rows the incumbent never trained on, the challenger wins, so
+    # promote — even though its raw number looks worse than the incumbent's stored one.
+    assert _should_promote("minutes", {
+        "log_loss": 0.97, "holdout": "2026-27:GW1-2026-27:GW1",
+        "head_to_head": {"rows": 600, "challenger": {"log_loss": 0.97},
+                         "incumbent": {"log_loss": 1.15}}})
+    # ...and refuse when the head-to-head goes the other way.
+    assert not _should_promote("minutes", {
+        "log_loss": 0.97, "holdout": "2026-27:GW1-2026-27:GW1",
+        "head_to_head": {"rows": 600, "challenger": {"log_loss": 0.97},
+                         "incumbent": {"log_loss": 0.80}}})
+
+
+def test_higher_is_better_metrics_compare_the_right_way(_no_incumbent):
+    from fplai.models.base import _should_promote
+
+    _no_incumbent["incumbent"] = _incumbent(spearman=0.26, holdout="h1")
+    assert _should_promote("goals90", {
+        "spearman": 0.31, "holdout": "h1",
+        "head_to_head": {"challenger": {"spearman": 0.31}, "incumbent": {"spearman": 0.26}}})
+    assert not _should_promote("goals90", {
+        "spearman": 0.21, "holdout": "h1",
+        "head_to_head": {"challenger": {"spearman": 0.21}, "incumbent": {"spearman": 0.26}}})
+
+
+def test_scores_from_different_holdouts_are_not_treated_as_comparable(_no_incumbent):
+    """Without a head-to-head, a mismatched window voids the comparison rather than
+    letting an unfalsifiable incumbent sit there forever."""
+    from fplai.models.base import _should_promote
+
+    _no_incumbent["incumbent"] = _incumbent(log_loss=0.43, holdout="2025-26:GW34-2025-26:GW38")
+    assert _should_promote("minutes", {"log_loss": 0.97, "holdout": "2026-27:GW1-2026-27:GW1"})
+    # Same window, no head-to-head: the raw numbers *are* comparable, so honour them.
+    same = "2025-26:GW34-2025-26:GW38"
+    assert not _should_promote("minutes", {"log_loss": 0.97, "holdout": same})
+    assert _should_promote("minutes", {"log_loss": 0.31, "holdout": same})
+
+
+def test_walk_forward_split_keeps_one_window_across_the_season_boundary():
+    """August used to collapse the holdout to a single gameweek of a brand new season."""
+    import pandas as pd
+    from fplai.models.train import _holdout_span, _split
+
+    rows = [{"season_id": "2025-26", "gameweek": gw, "v": 1} for gw in range(30, 39)]
+    rows += [{"season_id": "2026-27", "gameweek": 1, "v": 1}]
+    train, valid = _split(pd.DataFrame(rows), holdout_gws=5)
+
+    keys = sorted({(r.season_id, r.gameweek) for r in valid.itertuples()})
+    assert len(keys) == 5                       # not 1, even one week into a new season
+    assert keys[-1] == ("2026-27", 1)
+    assert keys[0] == ("2025-26", 35)          # four from last season, one from this one
+    # Strictly walk-forward: nothing in train is later than the earliest holdout key.
+    assert max((r.season_id, r.gameweek) for r in train.itertuples()) < keys[0]
+    assert _holdout_span(valid) == "2025-26:GW35-2026-27:GW1"
+
+
+# ══ feature coverage ═════════════════════════════════════════════════════════
+
+
+def test_no_model_declares_a_feature_nothing_can_build():
+    """The invariant that has no exceptions: if a model asks for it, something must
+    produce it. `manager_rotation_index` failed this for the whole of GW1-2."""
+    import fplai.features.builders  # noqa: F401 - importing registers every builder
+    from fplai.features.build import declared_features
+    from fplai.features.registry import BLOCK_INDICATORS, REGISTRY
+
+    buildable = set(REGISTRY) | set(BLOCK_INDICATORS)
+    for model, names in declared_features().items():
+        unwired = sorted(set(names) - buildable)
+        assert not unwired, f"{model} declares features nothing builds: {unwired}"
+
+
+def test_the_minutes_guard_feature_is_actually_computed(player_with_history, seeded_season):
+    """`_between_seasons` reads `days_since_team_match` off the computed feature dict.
+
+    It was written, unit-tested against a hand-built dict, and never once produced for a
+    real player — so the guard silently no-opped and every unused substitute kept the
+    price-led pre-season prior that ranks him as nailed.
+    """
+    from fplai.features.build import build_ctx
+    from fplai.features.registry import compute_all
+
+    values = compute_all(build_ctx(player_with_history, seeded_season, 1))
+    assert values["days_since_team_match"] is not None
+    assert values["days_since_last_match"] is not None
+
+
+def test_audit_coverage_names_features_the_store_never_received(
+    player_with_history, seeded_season
+):
+    from fplai.db.engine import writer
+    from fplai.features.build import audit_coverage
+
+    def put(fixture_key, name, value):
+        with writer() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO feature_values(season_id,gameweek,player_id,"
+                "fixture_key,name,value,computed_at,feature_version) VALUES(?,?,?,?,?,?,?,?)",
+                (seeded_season, 7, player_with_history, fixture_key, name, value,
+                 "2026-09-01T00:00:00+00:00", 1),
+            )
+
+    put(0, "price", 55.0)
+    put(1, "price", 61.0)          # two distinct values -> not constant
+    put(0, "is_home", 1.0)
+    put(1, "is_home", 1.0)         # one value everywhere -> constant
+
+    report = audit_coverage(seeded_season, 7)
+    assert report["healthy"] and report["unwired"] == []
+    # Declared, has a builder, but no source has ever written it — a data gap, not a bug.
+    assert "predicted_lineup_prob" in report["never_written"]
+    # Written for this gameweek but the same value throughout: nothing can split on it.
+    assert "is_home" in report["constant"]
+    assert "price" not in report["constant"]
+
+
+# ══ weekly scorecard ═════════════════════════════════════════════════════════
+
+
+def test_spearman_handles_ties_and_degenerate_input():
+    from fplai.models.backtest import _spearman_rho
+
+    assert _spearman_rho([1, 2, 3], [1, 2, 3]) == pytest.approx(1.0)
+    assert _spearman_rho([1, 2, 3], [3, 2, 1]) == pytest.approx(-1.0)
+    assert _spearman_rho([1, 1, 1], [1, 2, 3]) is None      # no variance, no correlation
+    assert _spearman_rho([1, 2], [2, 1]) is None            # too few points to mean anything
+    # Monotone but non-linear is still a perfect *rank* correlation.
+    assert _spearman_rho([1, 2, 3, 4], [1, 8, 27, 64]) == pytest.approx(1.0)
+
+
+def test_the_scorecard_only_grades_predictions_made_before_the_deadline(
+    player_with_history, seeded_season
+):
+    """Scoring the newest vintage would grade the model on rows written after the matches
+    were played — a scorecard that flatters itself is worse than no scorecard."""
+    from fplai.db.engine import writer
+    from fplai.models.backtest import _predictions_before_deadline
+
+    def put(generated_at, exp_points):
+        with writer() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO predictions(player_id,season_id,gameweek,fixture_key,"
+                "generated_at,p_start,exp_points,p_haul_10) VALUES(?,?,1,0,?,0.9,?,0.05)",
+                (player_with_history, seeded_season, generated_at, exp_points),
+            )
+
+    put("2026-08-20T09:00:00+00:00", 4.0)          # before the 2026-08-22T10:00 deadline
+    put("2026-08-23T09:00:00+00:00", 99.0)         # after the matches: must be ignored
+
+    rows = _predictions_before_deadline(seeded_season, 1)
+    assert [r["exp_points"] for r in rows] == [4.0]
+
+
+def test_an_artefact_written_by_another_filesystem_still_loads(tmp_path, monkeypatch):
+    """Paths were stored absolute, so a row written in the container said
+    `/app/data/models/minutes-*.pkl` and nothing on the host could open it. `load_active`
+    warned and returned None, and every caller quietly served heuristic numbers instead."""
+    import pickle
+
+    from fplai.models import base
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    artefact = models_dir / "minutes-20260101000000.pkl"
+    artefact.write_bytes(pickle.dumps({"i am": "the model"}))
+
+    class _S:
+        models_dir = str(tmp_path / "models")
+
+    monkeypatch.setattr(base, "get_settings", lambda: _S())
+
+    # The container's path does not exist here, but the filename does.
+    assert base._resolve_artefact("/app/data/models/minutes-20260101000000.pkl") == artefact
+    assert base._resolve_artefact(str(artefact)) == artefact          # already correct
+    assert base._resolve_artefact("/app/data/models/never-trained.pkl") is None
+
+
+def test_the_head_to_head_only_uses_rows_the_incumbent_never_trained_on(monkeypatch):
+    """The subtle half of the promotion bug. The incumbent was fitted a week ago on
+    everything up to then, so most of today's walk-forward window is in-sample for it;
+    scoring it there flatters it and blocks every honest successor. Measured on a 2020-24
+    refit, that gap alone rejected all seven challengers."""
+    import json as _json
+
+    import pandas as pd
+    from fplai.models import train
+
+    valid = pd.DataFrame(
+        [{"season_id": "2026-27", "gameweek": gw, "row": i}
+         for gw in (1, 2, 3) for i in range(40)]
+    )
+    # `_incumbent_score` imports load_active from .base at call time, so patch it there.
+    monkeypatch.setattr("fplai.models.base.load_active", lambda name: "the-incumbent")
+    monkeypatch.setattr(
+        train, "query_one",
+        lambda sql, params=(): {"metrics_json": _json.dumps({"trained_through": "2026-27:02"})},
+    )
+
+    seen = {}
+
+    def score(model, d=None):
+        seen["rows"] = len(d)
+        seen["gameweeks"] = sorted(set(d["gameweek"]))
+        return {"mae": 1.0}
+
+    result = train._head_to_head("goals90", score, valid, "the-challenger")
+    assert result["challenger"] == {"mae": 1.0} and result["incumbent"] == {"mae": 1.0}
+    assert result["rows"] == 40
+    assert seen["gameweeks"] == [3]        # GW1-2 were in the incumbent's training data
+    assert seen["rows"] == 40
+
+    # Nothing postdates it -> no honest comparison, so the caller falls back.
+    monkeypatch.setattr(
+        train, "query_one",
+        lambda sql, params=(): {"metrics_json": _json.dumps({"trained_through": "2026-27:09"})},
+    )
+    assert train._head_to_head("goals90", score, valid, "the-challenger") is None
+
+
+def test_training_records_how_far_its_data_reached():
+    import pandas as pd
+    from fplai.models.train import _last_key
+
+    df = pd.DataFrame([
+        {"season_id": "2025-26", "gameweek": 38},
+        {"season_id": "2026-27", "gameweek": 2},
+        {"season_id": "2026-27", "gameweek": 10},
+    ])
+    assert _last_key(df) == "2026-27:10"
+    assert _last_key(pd.DataFrame()) is None
+    # Zero-padded so plain string comparison still orders GW9 before GW10.
+    assert _last_key(df) > "2026-27:09"
+
+
+def test_an_incumbent_of_unknown_provenance_gets_no_head_to_head(monkeypatch):
+    """Without `trained_through` there is no slice we can be sure it never saw, and
+    assuming 'nothing' would score it in-sample and hand it a win it did not earn."""
+    import pandas as pd
+    from fplai.models import train
+
+    valid = pd.DataFrame([{"season_id": "2026-27", "gameweek": 3} for _ in range(100)])
+    monkeypatch.setattr("fplai.models.base.load_active", lambda name: "the-incumbent")
+    monkeypatch.setattr(train, "query_one", lambda sql, params=(): {"metrics_json": "{}"})
+
+    def score(model, d=None):
+        raise AssertionError("must not score an incumbent of unknown provenance")
+
+    assert train._head_to_head("goals90", score, valid, "the-challenger") is None
+
+
+def test_an_unknown_position_code_does_not_abort_a_gameweek():
+    """The 2024-25 archive labels 20 players `AM`, which raised KeyError out of the
+    simulator's scoring dicts and killed all 38 backtest gameweeks before they started."""
+    from fplai.defaults import normalise_position
+    from fplai.models.simulate import CS_POINTS, GOAL_POINTS
+
+    assert normalise_position("AM") == "MID"
+    assert normalise_position("GKP") == "GK"
+    assert normalise_position("gk") == "GK"
+    assert normalise_position(None) == "MID"
+    assert normalise_position("something new") == "MID"
+    for real in ("GK", "DEF", "MID", "FWD"):
+        assert normalise_position(real) == real
+    # And the scoring tables must not raise even if something slips through unnormalised.
+    assert GOAL_POINTS.get("AM", GOAL_POINTS["MID"]) == 5
+    assert CS_POINTS.get("AM", CS_POINTS["MID"]) == 1
+
+
+def test_the_simulator_reports_what_a_player_is_expected_to_lose():
+    """`exp_cards_penalty` and `exp_conceded_penalty` were written as NULL on every
+    prediction row ever produced, so the UI could show expected returns but never the
+    expected deductions behind a number."""
+    from fplai.models.simulate import FixtureInput, PlayerInput, simulate_gameweek
+
+    def player(pid, position, cards90=0.4):
+        return PlayerInput(
+            player_id=pid, position=position, team_id=1 if pid < 10 else 2, fixture_id=1,
+            p_start=0.95, p_cameo=0.03, exp_minutes=78.0, goals90=0.1, assists90=0.1,
+            defcon_rate90=6.0, defcon_dispersion=5.0, saves90=0.0, cards90=cards90,
+            exp_bps=20.0,
+        )
+
+    fx = FixtureInput(fixture_id=1, home_team_id=1, away_team_id=2,
+                      lambda_home=1.6, lambda_away=1.4, rho=-0.05)
+    fx.players = [player(1, "DEF"), player(2, "MID"), player(11, "GK", cards90=0.0)]
+    sim = simulate_gameweek([fx], n_sims=3000)
+
+    keeper = sim.components[11]
+    defender = sim.components[1]
+    midfielder = sim.components[2]
+
+    for comp in (keeper, defender, midfielder):
+        assert "cards_penalty" in comp and "conceded_penalty" in comp
+        assert comp["cards_penalty"].mean() >= 0
+    # A booked defender loses real points. The keeper has no yellow-card rate but reds are
+    # modelled independently of it, so his penalty is small rather than zero.
+    assert defender["cards_penalty"].mean() > 0.2
+    assert 0 <= keeper["cards_penalty"].mean() < 0.1
+    # Goals conceded only dock keepers and defenders.
+    assert keeper["conceded_penalty"].mean() > 0
+    assert defender["conceded_penalty"].mean() > 0
+    assert midfielder["conceded_penalty"].mean() == 0

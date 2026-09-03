@@ -360,10 +360,9 @@ def opponent_attack_rating(ctx: FeatureCtx) -> float | None:
     return ctx.extras.get("opp_attack_rating")
 
 
-@feature("opp_xga_per_game_last6", deps=["player_fixture_stats"], group="fixture")
-def opp_xga_per_game_last6(ctx: FeatureCtx) -> float | None:
-    rows = ctx.opp_history[:6]
-    return mean([r.get("goals_conceded") for r in rows]) if rows else None
+# `opp_xga_per_game_last6` lived here and was deleted: it read no expected goals at all,
+# just the mean of `goals_conceded` — the same quantity `opp_goals_conceded_ewma` computes
+# with a half-life, under a name that claimed otherwise — and no model ever consumed it.
 
 
 @feature("opp_clean_sheet_rate", deps=["player_fixture_stats"], group="fixture", missing="zero")
@@ -484,6 +483,18 @@ def days_since_last_match(ctx: FeatureCtx) -> float | None:
     return (asof - last).total_seconds() / 86400 if last and asof else None
 
 
+@feature("days_since_team_match", deps=["fixtures"], group="congestion")
+def days_since_team_match(ctx: FeatureCtx) -> float | None:
+    """Team-level twin of `days_since_last_match`. The pair separates *the league has not
+    played* from *he did not play* — a benched player is idle but his team is not, and
+    reading his idleness as the former is what makes an unused sub look nailed."""
+    if not ctx.team_history:
+        return None
+    last = _dt(ctx.team_history[0].get("kickoff_utc"))
+    asof = _dt(ctx.as_of)
+    return (asof - last).total_seconds() / 86400 if last and asof else None
+
+
 for _days in (7, 14, 21):
 
     def _make_load(days: int):
@@ -570,10 +581,11 @@ def intl_travel_km(ctx: FeatureCtx) -> float:
             "AFC": 9000.0, "OFC": 16000.0}.get(federation, 800.0)
 
 
-@feature("manager_rotation_index", deps=["player_fixture_stats"], group="congestion")
-def manager_rotation_index(ctx: FeatureCtx) -> float | None:
-    """How much this manager's XI churns in congested weeks versus normal ones."""
-    return ctx.extras.get("manager_rotation_index")
+# `manager_rotation_index` lived here and was deleted. It read `ctx.extras`, nothing ever
+# wrote that key, and so it produced None for all 13.5M rows in the store while sitting in
+# the minutes model's feature list and scaling the simulator's rotation shock. Reinstating
+# it needs team-level XI churn in `FeatureCtx` (every teammate's minutes over the team's
+# last N matches), which is a real query and belongs with real evidence that it pays.
 
 
 @feature("manager_tenure_days", deps=["teams"], group="congestion")
@@ -602,9 +614,21 @@ def fpl_chance_of_playing(ctx: FeatureCtx) -> float | None:
     return None
 
 
-STATUS_SCORE = {"available": 1.0, "doubt": 0.5, "injured": 0.0, "suspended": 0.0, "unknown": 0.7}
+STATUS_SCORE = {"available": 1.0, "doubt": 0.5, "injured": 0.0, "suspended": 0.0}
 SOURCE_WEIGHT = {"fpl_official": 2.0, "premier_injuries": 1.5, "physioroom": 1.0,
                  "transfermarkt": 0.6, "claims": 0.8}
+
+
+def _avail_score(a: dict) -> float | None:
+    """A source's read on one player, or None when it has nothing to say.
+
+    A scraper that lists a player without a verdict writes `unknown` with no percentage.
+    Scoring that as 0.7 casts a vote for mild doubt on a fit player and — worse — makes
+    him *disagree* with the sources that do know, which widens his minutes distribution
+    for no reason. Silence is not evidence, so it abstains."""
+    if a["chance_pct"] is not None:
+        return a["chance_pct"] / 100.0
+    return STATUS_SCORE.get(a["status"])
 
 
 @feature("injury_status_consensus", deps=["availability", "claims"], group="availability",
@@ -613,10 +637,10 @@ def injury_status_consensus(ctx: FeatureCtx) -> float | None:
     """Weighted vote across premierinjuries, physioroom, transfermarkt and claims."""
     num = den = 0.0
     for a in ctx.availability:
+        score = _avail_score(a)
+        if score is None:
+            continue
         w = SOURCE_WEIGHT.get(a["source_id"], 0.5)
-        score = (a["chance_pct"] / 100.0) if a["chance_pct"] is not None else STATUS_SCORE.get(
-            a["status"], 0.7
-        )
         num += w * score
         den += w
     return num / den if den else None
@@ -626,11 +650,7 @@ def injury_status_consensus(ctx: FeatureCtx) -> float | None:
 def source_disagreement_score(ctx: FeatureCtx) -> float | None:
     """Variance across sources. High disagreement should *widen* the minutes distribution,
     not shift it — the simulator reads this directly."""
-    scores = [
-        (a["chance_pct"] / 100.0) if a["chance_pct"] is not None
-        else STATUS_SCORE.get(a["status"], 0.7)
-        for a in ctx.availability
-    ]
+    scores = [s for s in (_avail_score(a) for a in ctx.availability) if s is not None]
     if len(scores) < 2:
         return 0.0
     m = sum(scores) / len(scores)

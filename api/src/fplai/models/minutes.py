@@ -44,7 +44,7 @@ FEATURES = [
     "days_since_injury_report", "news_signal_gap", "predicted_lineup_prob",
     "days_since_last_match", "player_minutes_last_7_days", "player_minutes_last_14_days",
     "team_matches_next_14_days", "midweek_european_flag", "european_competition_tier",
-    "international_break_flag", "manager_rotation_index", "new_manager_flag",
+    "international_break_flag", "new_manager_flag",
     "owned_pct", "is_template_flag", "kickoff_slot", "age",
     # Price is the only quality signal that exists before a ball is kicked, and
     # FPL prices it as a nailedness proxy too (docs/06 model 2).
@@ -145,10 +145,20 @@ def _between_seasons(f: dict[str, float | None]) -> bool:
     reads the whole league as doubtful and ranks a nailed-on £4.5m defender above a
     £15.5m striker. Last season's form plus price is a worse model but an honest one.
 
+    The question is whether *the league* has played, not whether *he* has. Asked with his
+    own minutes it answers yes for every unused substitute, because an unplayed GW1 leaves
+    him with zero minutes in 14 days and a last appearance back in May — so the one player
+    the evidence has just spoken loudest about is the one routed past the model, onto a
+    price-led prior that ranks him as nailed. `days_since_team_match` is the discriminator:
+    his club played on Saturday, so this is a team-sheet decision, not the close season.
+
     ponytail: a 30-day gap, not a fixture-calendar lookup. Nothing short of the summer
-    break leaves a squad player that idle, and a genuine long absentee is caught by
+    break leaves a whole club that idle, and a genuine long absentee is caught by
     `injury_status_consensus` inside the heuristic anyway.
     """
+    team_idle = f.get("days_since_team_match")
+    if team_idle is not None and team_idle <= 30:
+        return False
     return (f.get("player_minutes_last_14_days") or 0) == 0 and (
         f.get("days_since_last_match") or 0
     ) > 30

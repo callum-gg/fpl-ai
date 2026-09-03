@@ -15,7 +15,7 @@ from ...db.settings_store import squad_settings
 from ...defaults import DEFAULT_SQUAD_SETTINGS, SQUAD_COLOURS
 from ...fplsync import sync as fplsync
 from ...optimiser import recommend as rec_mod
-from ...rules import validate_squad
+from ...rules import CHIPS, MAX_FREE_TRANSFERS, selling_price, validate_squad
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/squads", tags=["squads"])
@@ -56,24 +56,39 @@ class ManualState(BaseModel):
     free_transfers: int = 1
     picks: list[dict]
     chips_used: list[dict] = Field(default_factory=list)
+    chip_active: str | None = None
 
 
 class DraftSeed(BaseModel):
-    """Start (or restart) the working copy. Defaults to a copy of the set squad."""
+    """Start (or restart) the working copy. Defaults to a copy of the set squad, and
+    starts empty when there is no set squad to copy."""
 
     from_recommendation: int | None = None
     gameweek: int | None = None
 
 
 class DraftEdit(BaseModel):
-    """Swap players in and out. `add` ids can come from anywhere — a recommendation's
-    squad, the player table, wherever the UI got them."""
+    """Swap players in and out, and override anything the sync got wrong.
+
+    Every field is optional and `None` means *leave it alone*, so the UI can send one
+    changed value without restating the rest. The exception is `chip_active`, where "no
+    chip" is itself a value worth setting: pass an empty string to clear it.
+    """
 
     add: list[int] = Field(default_factory=list)
     drop: list[int] = Field(default_factory=list)
     captain: int | None = None
     vice: int | None = None
     bank: int | None = None
+    # Manual overrides, for when the app and FPL have drifted apart. FPL is the source of
+    # truth and the sync is only a guess at it, so every number the sync sets has to be
+    # correctable by hand — otherwise a wrong free-transfer count silently poisons every
+    # hit calculation the planner makes, with no way to say so.
+    gameweek: int | None = None
+    free_transfers: int | None = None
+    chips_used: list[dict] | None = None
+    chip_active: str | None = None
+    prices: dict[int, int] | None = None   # player_id -> purchase price in tenths
 
 
 class PushExecute(BaseModel):
@@ -269,6 +284,7 @@ def put_state(squad_id: int, body: ManualState) -> dict:
             conn, squad_id, body.gameweek, "manual", picks,
             bank=body.bank, squad_value=sum(p.get("purchase_price", 0) for p in body.picks),
             free_transfers=body.free_transfers, chips_used_json=jdump(body.chips_used),
+            chip_active=body.chip_active,
         )
     return rec_mod.current_state(squad_id, body.gameweek)
 
@@ -374,10 +390,11 @@ def seed_draft(squad_id: int, body: DraftSeed) -> dict:
 
     state = rec_mod.current_state(squad_id)
     if state is None:
-        raise HTTPException(
-            400,
-            {"error": {"code": "no_state", "message": "no squad set yet — set one before drafting"}},
-        )
+        # No linked entry, or a sync that never landed. Refusing to open the editor is the
+        # one response that helps nobody: an empty fifteen is exactly what you want to fill
+        # in by hand when the app and FPL have nothing in common yet.
+        return _save_draft(squad_id, body.gameweek or next_gameweek(_season()), [],
+                           bank=0, free_transfers=1, chips_used=[], chip_active=None)
     return _save_draft(squad_id, body.gameweek or state["gameweek"], state["picks"],
                        state["bank"], state["free_transfers"],
                        json.loads(state["chips_used_json"]), state["chip_active"])
@@ -406,6 +423,24 @@ def edit_draft(squad_id: int, body: DraftEdit) -> dict:
         picks[pid] = {"player_id": pid, "is_captain": False, "is_vice": False,
                       "purchase_price": price, "selling_price": price}
 
+    # What you paid, which is not what he costs today. Selling price is derived from it —
+    # you keep only half the rise — so a squad reconstructed at today's prices quietly
+    # overstates your budget, and the planner spends money you do not have.
+    if body.prices:
+        current = _player_meta(list(body.prices))
+        for pid, paid in body.prices.items():
+            if pid not in picks:
+                continue
+            if paid <= 0:
+                raise HTTPException(
+                    400,
+                    {"error": {"code": "bad_price",
+                               "message": f"purchase price for player {pid} must be positive"}},
+                )
+            today = (current.get(pid) or {}).get("price") or paid
+            picks[pid]["purchase_price"] = paid
+            picks[pid]["selling_price"] = selling_price(paid, today)
+
     ordered = list(picks.values())
     for i, pick in enumerate(ordered, start=1):
         pick["position"] = i
@@ -417,8 +452,60 @@ def edit_draft(squad_id: int, body: DraftEdit) -> dict:
             pick["is_vice"] = pick["player_id"] == body.vice
 
     bank = draft["bank"] if body.bank is None else body.bank
-    return _save_draft(squad_id, draft["gameweek"], ordered, bank, draft["free_transfers"],
-                       json.loads(draft["chips_used_json"]), draft["chip_active"])
+
+    free_transfers = draft["free_transfers"]
+    if body.free_transfers is not None:
+        if not 0 <= body.free_transfers <= MAX_FREE_TRANSFERS:
+            raise HTTPException(
+                400,
+                {"error": {"code": "bad_free_transfers",
+                           "message": f"free transfers must be 0-{MAX_FREE_TRANSFERS}"}},
+            )
+        free_transfers = body.free_transfers
+
+    chips_used = json.loads(draft["chips_used_json"])
+    if body.chips_used is not None:
+        chips_used = _clean_chips_used(body.chips_used)
+
+    # "" is how the UI says "no chip this week"; None means the field was not sent at all.
+    chip_active = draft["chip_active"]
+    if body.chip_active is not None:
+        if body.chip_active and body.chip_active not in CHIPS:
+            raise HTTPException(
+                400,
+                {"error": {"code": "unknown_chip",
+                           "message": f"{body.chip_active!r} is not one of {', '.join(CHIPS)}"}},
+            )
+        chip_active = body.chip_active or None
+
+    return _save_draft(squad_id, body.gameweek or draft["gameweek"], ordered, bank,
+                       free_transfers, chips_used, chip_active)
+
+
+def _clean_chips_used(chips_used: list[dict]) -> list[dict]:
+    """Normalise a hand-entered chip history to the `{name, gameweek}` shape the rules read.
+
+    Everything downstream — expiry nags, chip legality, the planner's chip calendar —
+    indexes these by name and gameweek, so a typo here does not fail loudly. It just makes
+    a spent chip look available for the rest of the season.
+    """
+    out = []
+    for c in chips_used:
+        name, gw = c.get("name"), c.get("gameweek")
+        if name not in CHIPS:
+            raise HTTPException(
+                400,
+                {"error": {"code": "unknown_chip",
+                           "message": f"{name!r} is not one of {', '.join(CHIPS)}"}},
+            )
+        if not isinstance(gw, int) or gw < 1:
+            raise HTTPException(
+                400,
+                {"error": {"code": "bad_gameweek",
+                           "message": f"{name} needs the gameweek it was played in"}},
+            )
+        out.append({"name": name, "gameweek": gw})
+    return out
 
 
 @router.delete("/{squad_id}/draft")

@@ -220,14 +220,59 @@ def build_horizon_candidates(
     return out
 
 
-def _plan_context(squad_id: int, gameweek: int, settings: dict, state: dict | None) -> PlanContext:
+FREE_TRANSFER_CHIPS = ("wildcard", "freehit")
+
+
+def transfers_already_made(squad_id: int, gameweek: int, current_ids: list[int]) -> int:
+    """How many of this gameweek's transfers have already been spent.
+
+    A `manual` or `draft` state records the squad *after* a transfer but carries the free
+    transfer count from before it. On 28 Aug that told the planner a third transfer was
+    free when two were already gone, and the "0 hits" plan it produced actually cost -4.
+    Last gameweek's settled squad is the honest baseline, so diff against that.
+    """
+    if gameweek <= 1 or not current_ids:
+        return 0
+    prev = query_one(
+        "SELECT id FROM squad_states WHERE squad_id=? AND gameweek=? "
+        "ORDER BY (source='fpl_sync') DESC, captured_at DESC LIMIT 1",
+        (squad_id, gameweek - 1),
+    )
+    if prev is None:
+        return 0
+    previous = {
+        r["player_id"]
+        for r in query("SELECT player_id FROM squad_picks WHERE squad_state_id=?", (prev["id"],))
+    }
+    if not previous:
+        return 0
+    return len(set(current_ids) - previous)
+
+
+def free_transfers_remaining(squad_id: int, gameweek: int, state: dict | None) -> int:
+    stored = int((state or {}).get("free_transfers", 1) or 0)
     picks = (state or {}).get("picks", [])
+    if (state or {}).get("chip_active") in FREE_TRANSFER_CHIPS:
+        return stored  # transfers are free under a wildcard or free hit; nothing is spent
+    used = transfers_already_made(squad_id, gameweek, [p["player_id"] for p in picks])
+    if used:
+        log.info("squad %s GW%s: %d transfer(s) already made, %d free transfer(s) left",
+                 squad_id, gameweek, used, max(0, stored - used))
+    return max(0, stored - used)
+
+
+def _plan_context(
+    squad_id: int, gameweek: int, settings: dict, state: dict | None,
+    chips_allowed: set[str] | None = None,
+) -> PlanContext:
+    picks = (state or {}).get("picks", [])
+    chip_strategy = settings.get("chip_strategy", {})
     return PlanContext(
         start_gw=gameweek,
         horizon=int(settings.get("horizon_gws", 5)),
         current_squad=[p["player_id"] for p in picks],
         bank=(state or {}).get("bank", 0),
-        free_transfers=(state or {}).get("free_transfers", 1),
+        free_transfers=free_transfers_remaining(squad_id, gameweek, state),
         chips_used=_chips_used(state),
         chip_active=(state or {}).get("chip_active"),
         selling_prices={p["player_id"]: p.get("selling_price") or 0 for p in picks},
@@ -239,6 +284,9 @@ def _plan_context(squad_id: int, gameweek: int, settings: dict, state: dict | No
         locked_players=settings.get("locked_players", []),
         must_own=settings.get("must_own", []),
         max_bench_value=settings.get("max_bench_value"),
+        chips_allowed=chips_allowed,
+        wildcard_earliest_gw=int(chip_strategy.get("wildcard_earliest_gw", 0)),
+        save_second_set=bool(chip_strategy.get("save_second_set", False)),
     )
 
 
@@ -273,6 +321,18 @@ def recommend(
     state = working_state(squad_id, use_draft)
     variants = variants or list(VARIANTS)
 
+    # The chip calendar is computed once, here, and does two jobs: payload display and
+    # the planner's gate. A chip the calendar can't justify (no doubles/blanks known —
+    # actionable=False) gets no MILP variable at all; otherwise the solver burns it
+    # inside the horizon because saving it is worth nothing there.
+    state_teams = sorted({
+        p["team_id"] for p in (state or {}).get("picks", []) if p.get("team_id")
+    })
+    chip_recos = chips_mod.plan_chips(
+        season_id, gameweek, state_teams, chips_used=_chips_used(state)
+    )
+    chips_allowed = {r.chip for r in chip_recos if r.actionable}
+
     results: list[dict] = []
     baseline_points: float | None = None
 
@@ -289,7 +349,7 @@ def recommend(
             for gw, v in cands.items()
         }
 
-        ctx = _plan_context(squad_id, gameweek, settings, state)
+        ctx = _plan_context(squad_id, gameweek, settings, state, chips_allowed)
         _apply_constraints(ctx, constraints)
 
         if not ctx.current_squad:
@@ -307,7 +367,17 @@ def recommend(
             baseline_points = _do_nothing_points(pruned, ctx, profile)
 
         payload = _payload(plan, pruned, first_gw, ctx, settings, season_id, gameweek,
-                           baseline_points, variant, state, kind)
+                           baseline_points, variant, state, kind, chip_recos)
+
+        # Three cards that hold the same team are one choice wearing three hats. Once the
+        # projections compress, the risk terms (0.25*sd, 1.8*p_haul, the differential
+        # nudge) stop separating anything and every variant lands on the same squad — as
+        # `balanced` and `aggressive` did for the whole of GW2. Say so rather than letting
+        # the UI imply a decision that was never offered.
+        payload["same_as"] = _matching_variant(payload, results)
+        if payload["same_as"]:
+            log.info("variant %s is identical to %s", variant, payload["same_as"])
+
         rec = {
             "squad_id": squad_id,
             "gameweek": gameweek,
@@ -344,6 +414,28 @@ def recommend(
         rec["payload"] = payload
         results.append(rec)
     return results
+
+
+def _plan_fingerprint(payload: dict) -> tuple:
+    """What makes two recommendations the same decision: the fifteen, who starts, and
+    who wears the armband. Objective values differ by risk weighting even when the team
+    is byte-identical, so they are deliberately not part of this."""
+    lineup = payload.get("lineup") or {}
+    return (
+        tuple(sorted(p["player_id"] for p in payload.get("squad", []))),
+        tuple(sorted(p["player_id"] for p in lineup.get("xi", []))),
+        lineup.get("captain"),
+        payload.get("chip"),
+    )
+
+
+def _matching_variant(payload: dict, earlier: list[dict]) -> str | None:
+    """The name of an already-emitted variant holding this exact team, if any."""
+    mine = _plan_fingerprint(payload)
+    for rec in earlier:
+        if _plan_fingerprint(rec.get("payload") or {}) == mine:
+            return rec["variant"]
+    return None
 
 
 def _apply_constraints(ctx: PlanContext, constraints: dict | None) -> None:
@@ -423,7 +515,7 @@ def _do_nothing_points(pruned, ctx: PlanContext, profile: RiskProfile) -> float:
 
 
 def _payload(plan, pruned, first_gw, ctx, settings, season_id, gameweek, baseline, variant,
-             state, kind="transfer_plan"):
+             state, kind="transfer_plan", chip_recos=None):
     gw0 = plan.gameweeks[0]
     cands = pruned.get(gameweek, {})
 
@@ -466,12 +558,9 @@ def _payload(plan, pruned, first_gw, ctx, settings, season_id, gameweek, baselin
             }
         )
 
-    squad_teams = [cands[p].team_id for p in gw0.squad if p in cands]
-    chip_calendar = [
-        r.to_dict()
-        for r in chips_mod.plan_chips(season_id, gameweek, squad_teams,
-                                      chips_used=ctx.chips_used)
-    ]
+    # Calendar comes from recommend() (computed once against the real squad's teams)
+    # so the display and the planner's gate can never disagree.
+    chip_calendar = [r.to_dict() for r in (chip_recos or [])]
 
     return {
         "variant": variant,
@@ -515,8 +604,80 @@ def _payload(plan, pruned, first_gw, ctx, settings, season_id, gameweek, baselin
         ],
         "chip_calendar": chip_calendar,
         "chip_warnings": chips_mod.expiry_warnings(gameweek, ctx.chips_used),
+        "data_warnings": _data_warnings(season_id, gameweek, list(gw0.xi)),
         "delta_vs_do_nothing": round(delta_vs_nothing, 2) if delta_vs_nothing is not None else None,
     }
+
+
+# How old the availability feed may be before the plan stops trusting itself. Team news
+# lands in Friday press conferences, so anything older than half a day can be a full
+# news cycle behind FPL's own flags.
+STALE_AVAILABILITY_HOURS = 12.0
+
+
+def _hours_since(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    from datetime import datetime, timezone
+
+    try:
+        then = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - then).total_seconds() / 3600
+
+
+def _data_warnings(season_id: str, gameweek: int, xi: list[int]) -> list[str]:
+    """What the plan could not know, said out loud.
+
+    Every number above is only as fresh as the feed under it, and the two feeds that move
+    fastest — FPL's own injury flags and the prediction pass that reads them — are exactly
+    the two that go stale silently. A plan that cannot say "my team news is a day old" will
+    recommend a flagged player with total confidence, which is worse than not answering.
+    """
+    out: list[str] = []
+
+    avail = query_one("SELECT MAX(observed_at) t FROM availability WHERE source_id='fpl_official'")
+    avail_at = avail["t"] if avail else None
+    age = _hours_since(avail_at)
+    if age is None:
+        out.append("No FPL availability data at all — injury flags are unknown.")
+    elif age > STALE_AVAILABILITY_HOURS:
+        out.append(
+            f"FPL injury flags are {age:.0f}h old (last synced {avail_at}). "
+            "Re-run the bootstrap sync before trusting this XI."
+        )
+
+    pred = query_one(
+        "SELECT MAX(generated_at) t FROM predictions WHERE season_id=? AND gameweek=?",
+        (season_id, gameweek),
+    )
+    pred_at = pred["t"] if pred else None
+    if pred_at and avail_at and pred_at < avail_at:
+        out.append(
+            f"Predictions ({pred_at}) predate the latest team news ({avail_at}) — re-predict."
+        )
+
+    # Last line of defence: whatever the model priced him at, a flagged player in the XI
+    # gets named. This is the check that survives a stale minutes model.
+    if xi:
+        placeholders = ",".join("?" * len(xi))
+        flagged = query(
+            f"SELECT p.web_name name, a.status, a.chance_pct FROM availability a "
+            f"JOIN players p ON p.id=a.player_id JOIN ("
+            f"  SELECT player_id, MAX(observed_at) m FROM availability "
+            f"  WHERE source_id='fpl_official' AND player_id IN ({placeholders}) "
+            f"  GROUP BY player_id"
+            f") x ON x.player_id=a.player_id AND x.m=a.observed_at "
+            f"WHERE a.source_id='fpl_official' AND a.status != 'available'",
+            tuple(xi),
+        )
+        for r in flagged:
+            chance = f" ({r['chance_pct']}%)" if r["chance_pct"] is not None else ""
+            out.append(f"{r['name']} is flagged {r['status']}{chance} but is in the XI.")
+    return out
 
 
 def _alternatives(plan: Plan, baseline: float | None, threshold: float) -> list[dict]:
@@ -547,8 +708,9 @@ def _headline(transfers, gw0, delta, act, threshold, kind: str = "transfer_plan"
         return f"Keep the squad{chip}; the lineup change alone is worth it."
     bits = ", ".join(f"{t['out']['name']} → {t['in']['name']}" for t in transfers)
     hit = f" (taking a -{gw0.hits * 4} hit)" if gw0.hits else ""
+    chip = f", playing {gw0.chip}" if gw0.chip else ""
     gain = f" for +{delta:.1f} pts over the horizon" if delta is not None else ""
-    return f"Transfer {bits}{hit}{gain}."
+    return f"Transfer {bits}{hit}{chip}{gain}."
 
 
 def _write_evidence(rec_id: int, payload: dict, season_id: str, gameweek: int) -> None:

@@ -19,7 +19,9 @@ from .tasks import get as get_task
 
 log = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 6
+# ponytail: one round = one LLM completion, which may batch several tool calls.
+# 15 covers multi-player comparisons comfortably; raise if answers still truncate.
+MAX_TOOL_ROUNDS = 15
 
 
 # --- read-only tool implementations ---------------------------------------------

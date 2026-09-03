@@ -166,3 +166,80 @@ def test_every_squad_state_names_its_players_and_keeps_its_slot_numbers(client, 
     assert {p["position_name"] for p in picks} == {"GK", "DEF", "MID", "FWD"}
     assert all(p["web_name"] for p in picks)
     assert all(p["team_short"].startswith("TM") for p in picks)
+
+
+def test_a_disconnected_app_can_be_told_the_truth_by_hand(client, squad):
+    """Sync is a guess at what FPL holds. When it is wrong, every number must be typeable.
+
+    A stale free-transfer count prices every hit wrong, a chip the app thinks you still
+    hold gets planned into a gameweek you cannot use it in, and neither surfaces as an
+    error — they just quietly make the plan wrong. So the working copy takes overrides.
+    """
+    _set_squad(client, squad)
+    client.put("/api/squads/1/draft", json={})
+
+    draft = client.patch(
+        "/api/squads/1/draft",
+        json={
+            "gameweek": 7,
+            "bank": 125,
+            "free_transfers": 4,
+            "chip_active": "bboost",
+            "chips_used": [{"name": "wildcard", "gameweek": 3}],
+        },
+    ).json()
+
+    assert (draft["gameweek"], draft["bank"], draft["free_transfers"]) == (7, 125, 4)
+    assert draft["chip_active"] == "bboost"
+    assert json.loads(draft["chips_used_json"]) == [{"name": "wildcard", "gameweek": 3}]
+
+    # Omitted fields hold their value; "" is the only way to say "no chip this week".
+    kept = client.patch("/api/squads/1/draft", json={"bank": 130}).json()
+    assert kept["chip_active"] == "bboost" and kept["free_transfers"] == 4
+    assert client.patch("/api/squads/1/draft", json={"chip_active": ""}).json()["chip_active"] is None
+
+
+def test_a_hand_entered_purchase_price_drives_the_selling_price(client, squad):
+    """You keep half of any rise, so what you paid is not what he is worth to you.
+
+    Rebuilding a squad at today's prices overstates the budget by exactly the profit the
+    game does not let you keep, and the planner then spends money that does not exist.
+    """
+    _set_squad(client, squad)
+    client.put("/api/squads/1/draft", json={})
+    pid = squad[0]["player_id"]        # priced at 40 today
+
+    draft = client.patch("/api/squads/1/draft", json={"prices": {str(pid): 34}}).json()
+    pick = next(p for p in draft["picks"] if p["player_id"] == pid)
+    assert pick["purchase_price"] == 34
+    assert pick["selling_price"] == 37   # 3.4 paid, 4.0 now, half the 0.6 rise kept
+
+    assert client.patch("/api/squads/1/draft", json={"prices": {str(pid): 0}}).status_code == 400
+
+
+def test_nonsense_overrides_are_refused_rather_than_stored(client, squad):
+    """These all fail silently downstream, so they have to fail loudly here."""
+    _set_squad(client, squad)
+    client.put("/api/squads/1/draft", json={})
+
+    assert client.patch("/api/squads/1/draft", json={"free_transfers": 9}).status_code == 400
+    assert client.patch("/api/squads/1/draft", json={"chip_active": "triple"}).status_code == 400
+    assert client.patch(
+        "/api/squads/1/draft", json={"chips_used": [{"name": "wildcard"}]}
+    ).status_code == 400
+    assert client.patch(
+        "/api/squads/1/draft", json={"chips_used": [{"name": "nope", "gameweek": 2}]}
+    ).status_code == 400
+
+
+def test_a_squad_can_be_built_from_nothing_when_there_is_no_sync(client, squad):
+    """The disconnected case is the one that needs the editor, not the one to refuse it."""
+    r = client.put("/api/squads/1/draft", json={})   # no set squad exists yet
+    assert r.status_code == 200, r.text
+    assert r.json()["picks"] == [] and r.json()["ok"] is False
+
+    added = client.patch(
+        "/api/squads/1/draft", json={"add": [p["player_id"] for p in squad]}
+    ).json()
+    assert len(added["picks"]) == 15 and added["ok"] is True
+    assert client.post("/api/squads/1/draft/commit").status_code == 200

@@ -148,14 +148,53 @@ async def fpl_post_lockdown_reconcile() -> dict:
     row = query_one(
         "SELECT data_checked FROM gameweeks WHERE season_id=? AND gameweek=?", (season, gw)
     )
+    scorecard = None
     if row and row["data_checked"]:
         from ..features.build import build_gameweek
-        from ..models.backtest import resolve_pundit_calls
+        from ..models.backtest import resolve_pundit_calls, score_gameweek
 
         build_gameweek(season, gw)
         resolve_pundit_calls(season, gw)
+        # Grade the week the moment its results are final. Nothing in the app compared a
+        # projected number to the number the match produced until GW1-2 had already been
+        # played and lost, and every defect that post-mortem found was visible here.
+        scorecard = score_gameweek(season, gw)
+        if scorecard.get("pool_spearman") is not None and not scorecard.get("beats_ownership"):
+            log.warning(
+                "GW%s: the model ranked the buyable pool at rho=%.3f, below the free "
+                "ownership baseline at %.3f", gw, scorecard["pool_spearman"],
+                scorecard["pool_ownership_spearman"],
+            )
     return {"gameweek": gw, "reconciled": result.rows_upserted,
-            "data_checked": bool(row and row["data_checked"])}
+            "data_checked": bool(row and row["data_checked"]), "scorecard": scorecard}
+
+
+@job("score_predictions")
+def score_predictions() -> dict:
+    """Grade every finished gameweek that has not been graded yet.
+
+    Standalone twin of the scoring inside `fpl_post_lockdown_reconcile`, so a season can
+    be caught up in one call and so the metric that matters — can the model out-rank the
+    ownership column — has a history to read rather than one number.
+    """
+    from ..models.backtest import score_gameweek
+
+    season = _season()
+    done = {
+        r["gameweek"]
+        for r in query("SELECT DISTINCT gameweek FROM prediction_scores WHERE season_id=?",
+                       (season,))
+    }
+    finished = [
+        r["gameweek"]
+        for r in query(
+            "SELECT gameweek FROM gameweeks WHERE season_id=? AND finished=1 ORDER BY gameweek",
+            (season,),
+        )
+    ]
+    scored = [score_gameweek(season, gw) for gw in finished if gw not in done]
+    return {"scored": [s["gameweek"] for s in scored if s.get("n")],
+            "already_scored": sorted(done), "cards": scored}
 
 
 # --- other sources ----------------------------------------------------------------
@@ -207,7 +246,9 @@ async def transcripts() -> dict:
 
     done = 0
     for v in pending_transcripts(limit=10):
-        got = fetch_transcript(v["youtube_id"])
+        # ponytail: fetch_transcript is sync requests with no timeout (library has no
+        # knob) — off the loop thread, or one stalled socket freezes every scheduled job.
+        got = await asyncio.to_thread(fetch_transcript, v["youtube_id"])
         if got:
             store_transcript(v["id"], v["raw_doc_id"], *got)
             done += 1
@@ -245,11 +286,23 @@ def _horizon(season: str) -> list[int]:
 
 @job("build_features")
 def build_features() -> dict:
-    from ..features.build import build_gameweek
+    from ..features.build import audit_coverage, build_gameweek
 
     season = _season()
     built = {gw: build_gameweek(season, gw) for gw in _horizon(season)}
-    return {"gameweeks": list(built), "values": sum(built.values())}
+
+    # Audit the gameweek we are about to predict on. A model declaring a feature nothing
+    # writes is otherwise silent at every layer — see `audit_coverage` for how that cost
+    # the whole of GW1-2 — so the run says so out loud and the result is on the job record.
+    report = audit_coverage(season, min(built) if built else next_gameweek(season))
+    if report["unwired"]:
+        log.error("features %s are declared by a model and nothing builds them",
+                  ", ".join(report["unwired"]))
+    if report["never_written"]:
+        log.warning("features never written to the store (source unconfigured?): %s",
+                    ", ".join(report["never_written"]))
+
+    return {"gameweeks": list(built), "values": sum(built.values()), "coverage": report}
 
 
 @job("predict")
@@ -350,6 +403,10 @@ DEFAULT_CADENCE = {
     "fpl_element_summaries": "30 4 * * *",
     "fpl_entry_sync": "0 */6 * * *",
     "fpl_post_lockdown_reconcile": "30 9 * * *",
+    # An hour after the reconcile, and idempotent — it skips gameweeks already scored. The
+    # reconcile grades the week it just settled; this catches up anything a missed run left
+    # ungraded, so the accuracy history never quietly develops a hole.
+    "score_predictions": "30 10 * * *",
     "odds_poll": "0 */4 * * *",
     "injury_scrape": "15 */3 * * *",
     "lineups_poll": "20 * * * *",
@@ -425,6 +482,12 @@ def start() -> object | None:
             _scheduler.add_job(
                 _wrap(name), CronTrigger.from_crontab(cadence_for(name), timezone=s.tz),
                 id=name, replace_existing=True, max_instances=1, coalesce=True,
+                # APScheduler's default grace is one second, so any job whose slot ticks
+                # past while the loop is busy with a long one is dropped silently. That is
+                # how fpl_bootstrap — the only writer of injury flags — went a day without
+                # running while the chattier jobs beside it kept firing. Late is fine here;
+                # skipped is not.
+                misfire_grace_time=600,
             )
         except ValueError:
             log.warning("bad cron for job %s, skipping", name)

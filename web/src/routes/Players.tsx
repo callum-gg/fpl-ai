@@ -2,6 +2,8 @@
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
+  ALL_PLAYERS,
+  matchesName,
   money,
   pct,
   pts,
@@ -38,14 +40,12 @@ export function PlayerExplorer() {
     max_price: maxPrice ? Number(maxPrice) * 10 : undefined,
     min_minutes: minMinutes || undefined,
     sort,
-    limit: 600,
+    limit: ALL_PLAYERS,
   });
 
   const rows = useMemo(
     () =>
-      (data ?? []).filter((p) =>
-        !term ? true : p.web_name.toLowerCase().includes(term.toLowerCase()),
-      ),
+      (data ?? []).filter((p) => matchesName(p, term)),
     [data, term],
   );
 
@@ -153,12 +153,13 @@ export function PlayerDetail() {
   const { id } = useParams();
   const playerId = Number(id);
   const [tab, setTab] = useState<(typeof TABS)[number]>("Projection");
-  const { data: player, isLoading } = usePlayer(playerId);
+  const { data: player, isLoading, error } = usePlayer(playerId);
   const { data: features } = usePlayerFeatures(playerId);
   const { data: history } = usePlayerHistory(playerId);
   const { data: claims } = usePlayerClaims(playerId);
 
   if (isLoading) return <Loading />;
+  if (error) return <Empty title="Couldn't load player" hint={error.message} />;
   if (!player) return <Empty title="Player not found" />;
 
   const pred = player.prediction;

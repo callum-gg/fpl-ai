@@ -261,15 +261,38 @@ def _should_promote(model_name: str, metrics: dict) -> bool:
     if not get_settings().model_auto_promote:
         return False
     key, higher_better = PRIMARY_METRIC.get(model_name, ("log_loss", False))
-    new = metrics.get(key)
-    if new is None:
-        return True
     incumbent = query_one(
         "SELECT metrics_json FROM model_versions WHERE model_name=? AND is_active=1", (model_name,)
     )
     if incumbent is None:
-        return True
+        return True  # something beats nothing; this is the cold start
+
+    new = metrics.get(key)
+    if new is None:
+        # An unmeasured challenger must never displace a measured incumbent. This used to
+        # return True, which is how `saves90` shipped on 27 Aug with no MAE at all: its
+        # holdout held ~20 keepers, fell under the scoring threshold, and promoted anyway.
+        log.warning("model %s not promoted: no %s on this run, so it is unmeasured",
+                    model_name, key)
+        return False
+
     incumbent_metrics = json.loads(incumbent["metrics_json"])
+
+    # Preferred comparison: the live artefact re-scored on the very rows the challenger was
+    # scored on (`_incumbent_score` in train.py). A stored metric belongs to whatever
+    # holdout was current when it was trained — in August that is one gameweek of a new
+    # season against five of the last one, and comparing them froze six of eight models on
+    # pre-season fits. Head-to-head is the only comparison that answers the same question.
+    h2h = metrics.get("head_to_head")
+    if isinstance(h2h, dict):
+        mine = (h2h.get("challenger") or {}).get(key)
+        theirs = (h2h.get("incumbent") or {}).get(key)
+        if mine is not None and theirs is not None:
+            log.info("%s: head-to-head over %s shared rows the incumbent never trained on — "
+                     "challenger %s=%.4f vs incumbent %.4f",
+                     model_name, h2h.get("rows"), key, mine, theirs)
+            return mine > theirs if higher_better else mine < theirs
+
     old = incumbent_metrics.get(key)
     if old is None:
         return True
@@ -283,6 +306,14 @@ def _should_promote(model_name: str, metrics: dict) -> bool:
             log.info("%s: incumbent predates the current %s definition, promoting on that",
                      model_name, key)
             return True
+    # Same reasoning one level down: without a head-to-head, two scores from different
+    # validation windows are two different questions. Trust the fresher fit rather than
+    # letting an unfalsifiable incumbent sit there forever.
+    if metrics.get("holdout") != incumbent_metrics.get("holdout"):
+        log.info("%s: incumbent scored on holdout %s, challenger on %s — not comparable, "
+                 "promoting the fresher fit", model_name,
+                 incumbent_metrics.get("holdout"), metrics.get("holdout"))
+        return True
     return new > old if higher_better else new < old
 
 
@@ -311,13 +342,34 @@ def load_active(model_name: str):
         return None
     key = f"{model_name}:{row['id']}"
     if key not in _cache:
+        path = _resolve_artefact(row["artefact_path"])
+        if path is None:
+            log.warning("active %s artefact %s is missing — falling back to the heuristic",
+                        model_name, row["artefact_path"])
+            return None
         try:
-            with open(row["artefact_path"], "rb") as fh:
+            with path.open("rb") as fh:
                 _cache[key] = pickle.load(fh)
         except (OSError, pickle.UnpicklingError) as e:
             log.warning("could not load %s: %s", model_name, e)
             return None
     return _cache[key]
+
+
+def _resolve_artefact(stored: str) -> Path | None:
+    """Find an artefact whose recorded path was written by a different filesystem.
+
+    Paths were stored absolute, so a row written inside the container says
+    `/app/data/models/minutes-*.pkl` and nothing on the host can open it. `load_active`
+    then warns and returns None, and every caller quietly degrades to its heuristic — the
+    app keeps serving numbers that no longer come from the trained model. The filename is
+    the stable part, so fall back to the configured models_dir.
+    """
+    path = Path(stored)
+    if path.is_file():
+        return path
+    local = Path(get_settings().models_dir) / path.name
+    return local if local.is_file() else None
 
 
 def clear_cache() -> None:

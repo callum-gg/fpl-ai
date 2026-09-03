@@ -238,6 +238,49 @@ def backtest(
         typer.echo(f"  * {c}")
 
 
+@app.command()
+def score(
+    season: str = typer.Option(None, help="defaults to the current season"),
+    gameweek: int = typer.Option(None, help="one gameweek; omit to score every finished one"),
+) -> None:
+    """Grade finished gameweeks: what the model projected against what actually happened.
+
+    `pool_rho` is the number that matters — rank correlation among players you could
+    realistically buy — and it has to beat `own_rho`, the ownership column FPL publishes
+    for free. Through GW1-2 it did not.
+    """
+    _boot()
+    from .config import get_settings
+    from .models.backtest import score_gameweek
+
+    season = season or get_settings().current_season
+    if gameweek:
+        cards = [score_gameweek(season, gameweek)]
+    else:
+        from .db.engine import query
+
+        cards = [
+            score_gameweek(season, r["gameweek"])
+            for r in query(
+                "SELECT gameweek FROM gameweeks WHERE season_id=? AND finished=1 "
+                "ORDER BY gameweek", (season,)
+            )
+        ]
+
+    header = f"{'GW':<4}{'n':<6}{'MAE':<7}{'bias':<8}{'rho':<7}{'pool_rho':<10}{'own_rho':<10}{'verdict'}"
+    typer.echo(header)
+    for c in cards:
+        if not c.get("n"):
+            typer.echo(f"{c['gameweek']:<4}{c.get('note', 'nothing to score')}")
+            continue
+        beat = "beats ownership" if c["beats_ownership"] else "LOSES to ownership"
+        typer.echo(
+            f"{c['gameweek']:<4}{c['n']:<6}{c['mae']:<7.2f}{c['bias']:<+8.2f}"
+            f"{(c['spearman'] or 0):<7.3f}{(c['pool_spearman'] or 0):<10.3f}"
+            f"{(c['pool_ownership_spearman'] or 0):<10.3f}{beat}"
+        )
+
+
 @app.command("create-squad")
 def create_squad(
     name: str = typer.Argument(...),

@@ -40,6 +40,13 @@ CAVEATS = [
         f"{LOCKED_HOLDOUT} is a locked holdout. Repeatedly tuning against the same seasons "
         "overfits them; touch it at most twice a season."
     ),
+    (
+        "DefCon did not exist before 2025/26, so seasons earlier than that have no rows to "
+        "fit it on and the model keeps whatever DefCon artefact is live. It then projects "
+        "points into a season whose real scoring never awarded them, which flatters "
+        "defenders. Read a pre-2025/26 backtest as a regression baseline for changes, not "
+        "as a forecast of what the squad would truly have scored."
+    ),
 ]
 
 
@@ -370,3 +377,169 @@ def scoreboard(limit: int = 50) -> list[dict]:
             (limit,),
         )
     ]
+
+
+# --- weekly scorecard -------------------------------------------------------------
+
+
+POOL_MIN_PRICE = 45
+POOL_MIN_P_START = 0.5
+
+
+def _spearman_rho(a: list[float], b: list[float]) -> float | None:
+    """Rank correlation, ties averaged. Small enough to not be worth a scipy import."""
+    n = len(a)
+    if n < 3:
+        return None
+
+    def rank(v: list[float]) -> list[float]:
+        order = sorted(range(n), key=lambda i: v[i])
+        out = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            for k in range(i, j + 1):
+                out[order[k]] = (i + j) / 2 + 1
+            i = j + 1
+        return out
+
+    ra, rb = rank(a), rank(b)
+    ma, mb = sum(ra) / n, sum(rb) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb, strict=False))
+    den = (sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb)) ** 0.5
+    return (num / den) if den else None
+
+
+def _predictions_before_deadline(season_id: str, gameweek: int) -> list[dict]:
+    """The last vintage generated strictly before the deadline — what a manager saw.
+
+    Scoring the newest row instead would quietly grade the model on predictions written
+    after the matches had already been played.
+    """
+    return [
+        dict(r)
+        for r in query(
+            "SELECT p.* FROM predictions p JOIN ("
+            "  SELECT player_id, MAX(generated_at) g FROM predictions"
+            "  WHERE season_id=? AND gameweek=? AND generated_at < ("
+            "    SELECT deadline_utc FROM gameweeks WHERE season_id=? AND gameweek=?)"
+            "  GROUP BY player_id"
+            ") x ON x.player_id=p.player_id AND x.g=p.generated_at "
+            "WHERE p.season_id=? AND p.gameweek=?",
+            (season_id, gameweek, season_id, gameweek, season_id, gameweek),
+        )
+    ]
+
+
+def score_gameweek(season_id: str, gameweek: int, persist: bool = True) -> dict:
+    """Grade one finished gameweek's predictions against what actually happened.
+
+    This is the loop the project was missing. Every defect the GW1-2 post-mortem found —
+    the frozen promotion gate, the halved DefCon, the blacked-out xG feed — was visible in
+    a week of scored predictions and invisible everywhere else, because nothing ever
+    compared a number the model produced to the number the match produced.
+
+    `pool_spearman` is the metric that matters and `pool_ownership_spearman` is the bar:
+    if the model cannot out-rank the ownership column FPL publishes for free, the whole
+    stack is decoration.
+    """
+    preds = _predictions_before_deadline(season_id, gameweek)
+    if not preds:
+        return {"season_id": season_id, "gameweek": gameweek, "n": 0,
+                "note": "no predictions were generated before this deadline"}
+
+    actual = _actual_points(season_id, gameweek)
+    minutes = _minutes(season_id, gameweek)
+    if not actual:
+        return {"season_id": season_id, "gameweek": gameweek, "n": 0,
+                "note": "no results stored for this gameweek yet"}
+
+    prices = {
+        r["player_id"]: dict(r)
+        for r in query(
+            "SELECT player_id, price, selected_by_percent FROM player_prices p WHERE season_id=? "
+            "AND observed_at = (SELECT MAX(observed_at) FROM player_prices "
+            "  WHERE player_id=p.player_id AND season_id=p.season_id)",
+            (season_id,),
+        )
+    }
+
+    rows = []
+    for p in preds:
+        pid = p["player_id"]
+        if pid not in actual:
+            continue
+        pr = prices.get(pid) or {}
+        rows.append({
+            "pid": pid,
+            "pred": p["exp_points"] or 0.0,
+            "act": actual[pid],
+            "mins": minutes.get(pid, 0),
+            "p_start": p["p_start"] or 0.0,
+            "p_haul": p["p_haul_10"] or 0.0,
+            "price": pr.get("price") or 0,
+            "owned": pr.get("selected_by_percent") or 0.0,
+        })
+    if not rows:
+        return {"season_id": season_id, "gameweek": gameweek, "n": 0,
+                "note": "predictions and results share no players"}
+
+    n = len(rows)
+    err = [r["pred"] - r["act"] for r in rows]
+    played = [r for r in rows if r["mins"] > 0]
+    pool = [r for r in rows
+            if r["price"] >= POOL_MIN_PRICE and r["p_start"] >= POOL_MIN_P_START]
+    top15 = sorted(rows, key=lambda r: -r["pred"])[:15]
+
+    out = {
+        "season_id": season_id,
+        "gameweek": gameweek,
+        "scored_at": utcnow(),
+        "n": n,
+        "mae": sum(abs(e) for e in err) / n,
+        "rmse": (sum(e * e for e in err) / n) ** 0.5,
+        "bias": sum(err) / n,
+        "spearman": _spearman_rho([r["pred"] for r in rows], [r["act"] for r in rows]),
+        "played_mae": (sum(abs(r["pred"] - r["act"]) for r in played) / len(played))
+        if played else None,
+        "played_bias": (sum(r["pred"] - r["act"] for r in played) / len(played))
+        if played else None,
+        "pool_n": len(pool),
+        "pool_spearman": _spearman_rho([r["pred"] for r in pool], [r["act"] for r in pool]),
+        "pool_ownership_spearman": _spearman_rho([r["owned"] for r in pool],
+                                                 [r["act"] for r in pool]),
+        "pool_price_x_start_spearman": _spearman_rho(
+            [r["price"] * r["p_start"] for r in pool], [r["act"] for r in pool]),
+        "top15_mean_actual": sum(r["act"] for r in top15) / len(top15),
+        "league_mean_actual": sum(r["act"] for r in rows) / n,
+        "haul_rate": sum(1 for r in rows if r["act"] >= 10) / n,
+        "mean_p_haul": sum(r["p_haul"] for r in rows) / n,
+    }
+    out["beats_ownership"] = (
+        out["pool_spearman"] is not None
+        and out["pool_ownership_spearman"] is not None
+        and out["pool_spearman"] > out["pool_ownership_spearman"]
+    )
+    out["worst_misses"] = [
+        {"player_id": r["pid"], "projected": round(r["pred"], 2), "actual": r["act"]}
+        for r in sorted(rows, key=lambda r: -abs(r["pred"] - r["act"]))[:10]
+    ]
+
+    if persist:
+        with writer() as conn:
+            cols = ("season_id", "gameweek", "scored_at", "n", "mae", "rmse", "bias",
+                    "spearman", "played_mae", "played_bias", "pool_n", "pool_spearman",
+                    "pool_ownership_spearman", "pool_price_x_start_spearman",
+                    "top15_mean_actual", "league_mean_actual", "haul_rate", "mean_p_haul")
+            conn.execute(
+                f"INSERT OR REPLACE INTO prediction_scores({','.join(cols)},detail_json) "
+                f"VALUES({','.join('?' * len(cols))},?)",
+                (*[out[c] for c in cols],
+                 jdump({"beats_ownership": out["beats_ownership"],
+                        "worst_misses": out["worst_misses"]})),
+            )
+    log.info("GW%s scorecard: pool rho=%s vs ownership %s, MAE %.2f over %d players",
+             gameweek, out["pool_spearman"], out["pool_ownership_spearman"], out["mae"], n)
+    return out

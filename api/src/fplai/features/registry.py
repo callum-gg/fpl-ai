@@ -73,6 +73,16 @@ class Feature:
 
 REGISTRY: dict[str, Feature] = {}
 
+# Whole-block indicators reach the store from `FeatureCtx.blocks_present()`, not from an
+# `@feature` builder, so a coverage audit that only reads REGISTRY would call them missing.
+# Derived from the method itself so the two cannot drift apart.
+BLOCK_INDICATORS: frozenset[str] = frozenset(
+    FeatureCtx(
+        player_id=0, season_id="", gameweek=0, fixture_id=None, as_of="",
+        position="", team_id=None, opponent_team_id=None, is_home=False,
+    ).blocks_present()
+)
+
 
 def feature(
     name: str,

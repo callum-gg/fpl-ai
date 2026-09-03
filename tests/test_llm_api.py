@@ -311,3 +311,60 @@ def test_openapi_schema_generates(client):
     paths = schema["paths"]
     for expected in ("/api/squads", "/api/players", "/api/settings/global", "/api/health"):
         assert expected in paths, expected
+
+
+def test_the_adjuster_reads_the_claim_types_the_extractor_actually_emits(seeded_season):
+    """It fired on 0 of 1,211 predictions across GW1-2. The extractor's vocabulary and the
+    adjuster's accepted list barely overlapped: `manager_quote` alone is 43 of the 267
+    claims held and was ignored, while pundit opinion is excluded on purpose."""
+    from fplai.llm.adjust import ADJUSTABLE_CLAIM_TYPES
+
+    assert "manager_quote" in ADJUSTABLE_CLAIM_TYPES     # the pre-deadline presser
+    assert "penalty_duty" in ADJUSTABLE_CLAIM_TYPES      # a real role change
+    for opinion in ("recommendation", "captain_pick", "avoid", "transfer_rumour"):
+        assert opinion not in ADJUSTABLE_CLAIM_TYPES     # circular: that is the model's job
+    assert "form" not in ADJUSTABLE_CLAIM_TYPES          # already in xg90/xa90/bps90
+
+
+def test_a_claim_with_no_sentiment_and_no_implied_direction_abstains(seeded_season, monkeypatch):
+    """The old fallback scored any unlabelled non-injury claim at +0.3, inventing a
+    positive signal from a manager quote that said nothing either way."""
+    from fplai.llm import adjust
+
+    def claims(kind):
+        return [{"id": i, "grp": i, "claim_type": kind, "sentiment": None, "confidence": 1.0,
+                 "trust_weight": 1.0, "is_reported": 0, "source_id": "rss_news",
+                 "text_span": "asked about him"} for i in (1, 2)]
+
+    monkeypatch.setattr(adjust, "recent_claims", lambda pid, since_hours=36: claims("manager_quote"))
+    assert adjust.compute_adjustment(1, 6.0) == (0.0, None, [])
+
+    # An injury with no sentiment still means what its name says.
+    monkeypatch.setattr(adjust, "recent_claims", lambda pid, since_hours=36: claims("injury"))
+    value, reason, _ = adjust.compute_adjustment(1, 6.0)
+    assert value < 0 and reason
+
+
+def test_trust_weight_is_available_to_non_video_sources(seeded_season, db):
+    """`trust_weight` only joined through videos->channels, so an RSS or Bluesky claim
+    carried NULL and could never reach TIER1_TRUST however trusted its source was."""
+    from fplai.db.engine import query_one, utcnow, writer
+    from fplai.llm.adjust import recent_claims
+    from fplai.resolve.entities import upsert_player
+
+    doc = _make_raw_doc("Trust Probe is out for weeks with a hamstring problem.")
+    with writer() as conn:
+        pid = upsert_player(conn, "Trust Probe", "Trust", "Probe", "Probe")
+        conn.execute("UPDATE sources SET trust_weight=2.0 WHERE id='rss_news'")
+        conn.execute(
+            "INSERT INTO claims(raw_doc_id,player_id,claim_type,sentiment,confidence,"
+            "is_reported,text_span,extracted_at,extractor_model) "
+            "VALUES(?,?,'injury',-1.0,1.0,0,'out for weeks',?,'test')",
+            (doc, pid, utcnow()),
+        )
+
+    got = recent_claims(pid)
+    assert got and got[0]["trust_weight"] == 2.0
+    with writer() as conn:
+        conn.execute("UPDATE sources SET trust_weight=1.0 WHERE id='rss_news'")
+    assert query_one("SELECT trust_weight FROM sources WHERE id='rss_news'")["trust_weight"] == 1.0

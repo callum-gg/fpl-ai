@@ -56,6 +56,9 @@ class PlanContext:
     min_bank: int = 0
     max_bench_value: int | None = None
     allow_chips: bool = True
+    chips_allowed: set[str] | None = None  # None = unrestricted; else only these chips
+    wildcard_earliest_gw: int = 0
+    save_second_set: bool = False
     force_chip: tuple[str, int] | None = None   # (chip, gameweek)
     force_in: list[int] = field(default_factory=list)
     force_out: list[int] = field(default_factory=list)
@@ -205,10 +208,31 @@ def solve_plan(
             prob += ft[g] == ctx.free_transfers
         else:
             prev = gws[i - 1]
-            # ft[g] = min(5, ft[g-1] - used + 1), linearised: <= both arms, and the
+            wc_prev = chips.get(("wildcard", prev))
+            fh_prev = chips.get(("freehit", prev))
+            # ponytail: never `var or 0` on LpVariables — pulp defines __bool__ as
+            # False, which would silently collapse the relaxation to zero.
+            free_prev = pulp.lpSum(v for v in (wc_prev, fh_prev) if v is not None)
+            # ft[g] = min(5, ft[g-1] - used + 1), linearised: <= all arms, and the
             # objective's hit penalty pushes it up to whichever binds.
             used = pulp.lpSum(tin[(p, prev)] for p in ids) - hits[prev]
-            prob += ft[g] <= ft[prev] - used + 1
+            # Chip transfers come out of the chip, not the bank — relax the drain
+            # under a wildcard/free hit.
+            prob += ft[g] <= ft[prev] - used + 1 + BIG_M * free_prev
+            # Always valid, and the only cap on a Free Hit GW (its transfers are
+            # separate, so the bank just accrues +1 as if you'd made no transfers).
+            prob += ft[g] <= ft[prev] + 1
+            # A wildcard forfeits banked FTs: you enter the next gameweek with exactly
+            # one. Lower + upper arms pin it — ft only floats where nothing cares.
+            if wc_prev is not None:
+                prob += ft[g] <= 1 + BIG_M * (1 - wc_prev)
+                prob += ft[g] >= wc_prev
+            # A Free Hit leaves the bank untouched. Lower arm preserves (not accrues):
+            # demanding ft[prev]+1 here would demand 6 at a full bank against the cap
+            # of 5 — infeasible. The upper arms still give the +1 (capped) whenever
+            # hit pressure pushes ft up, and the value is exact at the cap.
+            if fh_prev is not None:
+                prob += ft[g] >= ft[prev] - BIG_M * (1 - fh_prev)
             prob += ft[g] <= MAX_FREE_TRANSFERS
 
     # --- personal constraints --------------------------------------------------------
@@ -249,15 +273,32 @@ def solve_plan(
 
 
 def _chip_vars(prob, gws: list[int], ctx: PlanContext) -> dict:
-    """One binary per (chip, gameweek), with set-1 expiry and one-chip-per-GW enforced."""
+    """One binary per (chip, gameweek), with set-1 expiry and one-chip-per-GW enforced.
+
+    Policy gates (chips_allowed / wildcard_earliest_gw / save_second_set) remove the
+    variable entirely: inside a short horizon saving a chip is worth nothing, so a
+    schedulable chip gets burned in GW2 even when the chip calendar says there is no
+    fixture-driven case for it. An explicit force or chip_active overrides policy —
+    if you activated it, it plays.
+    """
     chips: dict[tuple[str, int], pulp.LpVariable] = {}
     if not ctx.allow_chips:
         return chips
     used_by_set = {(u["name"], chip_set(u["gameweek"])) for u in ctx.chips_used}
+    forced = {ctx.force_chip} if ctx.force_chip else set()
+    if ctx.chip_active:
+        forced.add((ctx.chip_active, ctx.start_gw))
     for chip in ("wildcard", "freehit", "bboost", "3xc"):
         for g in gws:
             if (chip, chip_set(g)) in used_by_set:
                 continue  # already spent in this half
+            if (chip, g) not in forced:
+                if ctx.chips_allowed is not None and chip not in ctx.chips_allowed:
+                    continue  # calendar: no fixture-driven case for this chip yet
+                if chip == "wildcard" and g < ctx.wildcard_earliest_gw:
+                    continue  # squad policy: no wildcard this early
+                if ctx.save_second_set and chip_set(g) == 2:
+                    continue  # squad policy: keep the second set in reserve
             chips[(chip, g)] = pulp.LpVariable(f"chip_{chip}_{g}", cat="Binary")
 
     for chip in ("wildcard", "freehit", "bboost", "3xc"):

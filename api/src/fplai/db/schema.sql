@@ -565,6 +565,26 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     detail_json   TEXT NOT NULL
 );
 
+-- One row per gameweek scored after the fact: what the model said against what happened.
+-- The point of `pool_*` is that overall rank correlation flatters the model — ranking a
+-- fourth-choice keeper below Haaland is not a skill. `pool_spearman` covers only players
+-- you could actually buy, and `pool_ownership_spearman` is the free baseline it has to
+-- beat: through GW1-2 it did not (0.331 against 0.409).
+CREATE TABLE IF NOT EXISTS prediction_scores (
+    season_id     TEXT NOT NULL,
+    gameweek      INTEGER NOT NULL,
+    scored_at     TEXT NOT NULL,
+    n             INTEGER NOT NULL,
+    mae           REAL, rmse REAL, bias REAL, spearman REAL,
+    played_mae    REAL, played_bias REAL,
+    pool_n        INTEGER, pool_spearman REAL,
+    pool_ownership_spearman REAL, pool_price_x_start_spearman REAL,
+    top15_mean_actual REAL, league_mean_actual REAL,
+    haul_rate REAL, mean_p_haul REAL,
+    detail_json   TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (season_id, gameweek, scored_at)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     scope       TEXT NOT NULL,
     key         TEXT NOT NULL,

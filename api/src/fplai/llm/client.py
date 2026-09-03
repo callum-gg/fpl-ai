@@ -160,7 +160,11 @@ async def complete(
             if attempt == s.llm_max_retries:
                 _log_call(task.name, model, phash, {}, int((time.monotonic() - started) * 1000),
                           False, False, str(e)[:500], None)
-                raise
+                if isinstance(e, LLMUnavailable):
+                    raise
+                # Transport/auth failures must surface as LLMUnavailable so callers that
+                # degrade gracefully catch them instead of crashing on raw httpx errors.
+                raise LLMUnavailable(f"llm call failed: {e}") from e
     else:  # pragma: no cover - loop always breaks or raises
         raise last_error or RuntimeError("llm call failed")
 

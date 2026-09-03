@@ -96,8 +96,18 @@ export type SquadState = {
   squad_value: number;
   free_transfers: number;
   chip_active: string | null;
+  chips_used_json?: string | null;
   picks: Pick[];
 };
+
+export const CHIPS = ["wildcard", "freehit", "bboost", "3xc"] as const;
+export const CHIP_LABELS: Record<string, string> = {
+  wildcard: "Wildcard",
+  freehit: "Free Hit",
+  bboost: "Bench Boost",
+  "3xc": "Triple Captain",
+};
+export type ChipUse = { name: string; gameweek: number };
 
 export type PlayerRef = {
   player_id: number;
@@ -171,6 +181,7 @@ export type Recommendation = {
 export type PlayerRow = {
   id: number;
   web_name: string;
+  canonical_name?: string;
   position: string;
   team_id: number;
   team_name: string;
@@ -187,6 +198,17 @@ export type PlayerRow = {
   value: number | null;
   form_sparkline: number[];
 };
+
+/** Name search, shared by every list that has a search box.
+ *
+ * `web_name` is the shirt name, so a squad list matches "Watkins" and misses "Ollie
+ * Watkins" — which is what a person actually types. Both names, one matcher, so the two
+ * screens can never disagree about whether a player exists. */
+export function matchesName(p: { web_name: string; canonical_name?: string }, term: string) {
+  const t = term.trim().toLowerCase();
+  if (!t) return true;
+  return `${p.web_name} ${p.canonical_name ?? ""}`.toLowerCase().includes(t);
+}
 
 export type Deadline = {
   season_id: string;
@@ -270,6 +292,11 @@ export const usePlayerHistory = (id?: number) =>
 export const usePlayerClaims = (id?: number) =>
   q<any[]>(["player-claims", id], `/api/players/${id}/claims`, { enabled: !!id });
 
+/** What to ask for when you want the whole league. The endpoint caps `limit` at 1000 and
+ *  there are ~620 players in a season, so anything smaller truncates silently — which is
+ *  indistinguishable, from the UI, from the player simply not existing. */
+export const ALL_PLAYERS = 1000;
+
 export const usePlayers = (filters: Record<string, string | number | undefined> = {}) => {
   const qs = Object.entries(filters)
     .filter(([, v]) => v !== undefined && v !== "")
@@ -332,7 +359,7 @@ export const useDraft = (squadId?: number) =>
 export function useSeedDraft(squadId?: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { from_recommendation?: number } = {}) =>
+    mutationFn: (body: { from_recommendation?: number; gameweek?: number } = {}) =>
       api.put<Draft>(`/api/squads/${squadId}/draft`, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["draft", squadId] }),
   });
@@ -347,6 +374,13 @@ export function useEditDraft(squadId?: number) {
       captain?: number;
       vice?: number;
       bank?: number;
+      // Manual overrides for when the sync and FPL disagree. Omit a field to leave it
+      // alone; `chip_active: ""` is how you clear the chip rather than skip the field.
+      gameweek?: number;
+      free_transfers?: number;
+      chips_used?: ChipUse[];
+      chip_active?: string;
+      prices?: Record<number, number>;
     }) => api.patch<Draft>(`/api/squads/${squadId}/draft`, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["draft", squadId] }),
   });

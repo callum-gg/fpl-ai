@@ -9,6 +9,7 @@ A new version is promoted only if it beats the incumbent on the held-out window
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from datetime import datetime
@@ -82,15 +83,98 @@ def _weights(df, current_season: str) -> np.ndarray:
 
 
 def _split(df, holdout_gws: int = 5):
-    """Walk-forward split: the last `holdout_gws` gameweeks of the newest season."""
+    """Walk-forward split: the last `holdout_gws` played gameweeks, wherever they fall.
+
+    Taking them from the newest season *alone* collapses the window to a single gameweek
+    every August — a ~600-row holdout scored against an incumbent's ~4,000-row one, which
+    is not a comparison at all and is how six of eight models stayed frozen on pre-season
+    fits through GW1-2. It also starved the per-position slices: `saves90` saw ~20 keepers,
+    fell under the scoring threshold, and was promoted with no measured skill whatsoever.
+
+    Ordering by (season, gameweek) and taking the last N keeps one definition all year and
+    simply spans the season boundary for the first few weeks of a new one. Still strictly
+    walk-forward: everything in the holdout is later than everything used to fit.
+    """
     if df.empty:
         return df, df
-    newest = df["season_id"].max()
-    latest_gw = int(df.loc[df["season_id"] == newest, "gameweek"].max())
-    cut = latest_gw - holdout_gws
-    train = df[(df["season_id"] < newest) | (df["gameweek"] <= cut)]
-    valid = df[(df["season_id"] == newest) & (df["gameweek"] > cut)]
-    return train, valid
+    keys = [(s, int(g)) for s, g in zip(df["season_id"], df["gameweek"], strict=False)]
+    holdout = set(sorted(set(keys))[-holdout_gws:])
+    in_holdout = np.array([k in holdout for k in keys])
+    return df[~in_holdout], df[in_holdout]
+
+
+def _holdout_span(valid_df) -> str | None:
+    """Compact identity for the validation window, stored beside every metric."""
+    if valid_df is None or valid_df.empty:
+        return None
+    keys = sorted({(s, int(g)) for s, g in zip(valid_df["season_id"], valid_df["gameweek"],
+                                               strict=False)})
+    return f"{keys[0][0]}:GW{keys[0][1]}-{keys[-1][0]}:GW{keys[-1][1]}"
+
+
+def _key(season_id: str, gameweek) -> str:
+    """Sortable (season, gameweek) key, so string comparison orders the calendar."""
+    return f"{season_id}:{int(gameweek):02d}"
+
+
+def _last_key(df) -> str | None:
+    """How far the training data reaches — recorded so a later run knows what this fit saw."""
+    if df is None or df.empty:
+        return None
+    return max(_key(s, g) for s, g in zip(df["season_id"], df["gameweek"], strict=False))
+
+
+def _head_to_head(name: str, score, valid_df, challenger) -> dict | None:
+    """Both models scored on the same rows — and only rows the incumbent never trained on.
+
+    Three ways this comparison goes wrong, and all three were live at once:
+
+    1. A *stored* metric belongs to whatever holdout was current when it was trained, so
+       comparing it to a fresh number compares two different questions. That is what froze
+       six of eight models on pre-season fits through GW1-2.
+    2. Re-scoring the incumbent on the whole of today's window is no better: it was fitted
+       a week ago on everything up to then, so most of that window is in-sample for it, and
+       the flattered score blocks every honest successor. On the 2020-24 refit that gap
+       alone rejected all seven challengers.
+    3. Scoring the challenger on the full window and the incumbent on a subset of it is
+       the first bug again in a different hat.
+
+    So: both models, the same rows, and only gameweeks that postdate the incumbent's own
+    training data. If too few of those exist to mean anything there is no honest comparison
+    to make, and the caller falls back to promoting the fresher fit.
+    """
+    from .base import load_active
+
+    live = load_active(name)
+    if live is None:
+        return None
+
+    row = query_one(
+        "SELECT metrics_json FROM model_versions WHERE model_name=? AND is_active=1", (name,)
+    )
+    through = json.loads(row["metrics_json"]).get("trained_through") if row else None
+    if not through:
+        # No record of what this artefact was trained on, so there is no slice we can be
+        # sure it never saw. Assuming "nothing" would score it in-sample and hand it a win
+        # it did not earn; the caller's holdout rule takes over instead.
+        log.info("%s: incumbent does not record how far its training data reached — "
+                 "no head-to-head is possible against it", name)
+        return None
+
+    keys = [_key(s, g) for s, g in
+            zip(valid_df["season_id"], valid_df["gameweek"], strict=False)]
+    unseen = valid_df[np.array([k > through for k in keys], dtype=bool)]
+    if len(unseen) < 30:
+        log.info("%s: only %d holdout rows postdate the incumbent's training data — no "
+                 "honest head-to-head, deferring to the fresher fit", name, len(unseen))
+        return None
+    try:
+        return {"rows": len(unseen),
+                "challenger": score(challenger, unseen),
+                "incumbent": score(live, unseen)}
+    except Exception:
+        log.exception("could not score the incumbent %s on this holdout", name)
+        return None
 
 
 def train_all(seasons: list[str] | None = None, models: list[str] | None = None) -> dict:
@@ -117,6 +201,11 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
         # caught overfitting.
         cutoff = _holdout_cutoff(valid_df)
         scored = team_mod.fit(seasons, as_of=cutoff) if cutoff else tm
+        # No head-to-head here, deliberately. The shipped artefact is `tm`, fitted on every
+        # match including the holdout, so re-scoring it on that holdout is an in-sample
+        # read and flatters it by ~0.5 nats — enough to block every honest successor and
+        # rebuild the freeze this whole change exists to remove. `baseline_nll` below is
+        # the comparable gate: beat league-average Poisson or the strengths do nothing.
         results["team_goals"] = {
             # Mean NLL of the exact scoreline over an ~11x11 grid — NOT a binary log-loss,
             # so it does not compare to the minutes model's. The baseline is what makes it
@@ -124,6 +213,8 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
             "log_loss": _team_model_score(scored, cutoff),
             "baseline_nll": _baseline_scoreline_nll(cutoff),
             "holdout_from": cutoff,
+            "holdout": _holdout_span(valid_df),
+            "trained_through": _last_key(train_df),
             "n_teams": len(tm.attack),
             "home_adv": tm.home_adv,
             "rho": tm.rho,
@@ -151,7 +242,7 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
         results["defcon"] = _train_defcon(train_df, valid_df, seasons, settings.current_season)
 
     if "bonus" in wanted:
-        results["bonus"] = _train_bonus(train_df, valid_df, seasons, settings.current_season)
+        results["bonus"] = _train_bonus(df, train_df, valid_df, seasons, settings.current_season)
 
     _notify(results)
     return results
@@ -175,16 +266,21 @@ def _train_minutes(train_df, valid_df, seasons, current_season) -> dict:
     X = to_matrix(rows, minutes_mod.FEATURES)
     artifact = minutes_mod.train(X, y, minutes_mod.FEATURES, weights=_weights(played, current_season))
 
-    metrics: dict = {"train_rows": len(played)}
+    metrics: dict = {"train_rows": len(played), "holdout": _holdout_span(valid_df),
+                     "trained_through": _last_key(train_df)}
     if len(valid_df) > 30:
-        vy = np.array([minutes_mod.label_row(m, s) for m, s in
-                       zip(valid_df["minutes"], valid_df["starts"], strict=False)])
-        vX = to_matrix(valid_df.to_dict("records"), minutes_mod.FEATURES)
-        probs = artifact.predict_proba(vX)
-        metrics["log_loss"] = log_loss(vy, probs)
-        cal = minutes_mod.calibration(artifact, vX, vy)
-        metrics["calibration_ece"] = cal["ece"]
-        metrics["calibration_curve"] = cal["curve"]
+
+        def score(a, d=None) -> dict:
+            d = valid_df if d is None else d
+            vy = np.array([minutes_mod.label_row(m, s) for m, s in
+                           zip(d["minutes"], d["starts"], strict=False)])
+            vX = to_matrix(d.to_dict("records"), minutes_mod.FEATURES)
+            cal = minutes_mod.calibration(a, vX, vy)
+            return {"log_loss": log_loss(vy, a.predict_proba(vX)),
+                    "calibration_ece": cal["ece"], "calibration_curve": cal["curve"]}
+
+        metrics.update(score(artifact))
+        metrics["head_to_head"] = _head_to_head("minutes", score, valid_df, artifact)
     metrics["importance"] = _top_importance(artifact)
     save_artifact("minutes", artifact, metrics, {"features": minutes_mod.FEATURES},
                   len(played), seasons, FEATURE_VERSION)
@@ -202,15 +298,21 @@ def _train_rate(name, cols, target_fn, objective, train_df, valid_df, seasons, c
     artifact = fit_lgbm_regressor(X, y, cols, objective=objective,
                                   weights=_weights(played, current_season))
 
-    metrics: dict = {"train_rows": len(played)}
+    metrics: dict = {"train_rows": len(played), "holdout": _holdout_span(valid_df),
+                     "trained_through": _last_key(train_df)}
     vd = valid_df[valid_df["minutes"].fillna(0) > 0]
     if name == "saves90":
         vd = vd[vd["position"] == "GK"]
     if len(vd) > 30:
-        vy = target_fn(vd).to_numpy()
-        pred = artifact.predict(to_matrix(vd.to_dict("records"), cols))
-        metrics.update({"mae": mae(vy, pred), "rmse": rmse(vy, pred),
-                        "spearman": spearman(vy, pred)})
+
+        def score(a, d=None) -> dict:
+            d = vd if d is None else d
+            vy = target_fn(d).to_numpy()
+            pred = a.predict(to_matrix(d.to_dict("records"), cols))
+            return {"mae": mae(vy, pred), "rmse": rmse(vy, pred), "spearman": spearman(vy, pred)}
+
+        metrics.update(score(artifact))
+        metrics["head_to_head"] = _head_to_head(name, score, vd, artifact)
     metrics["importance"] = _top_importance(artifact)
     save_artifact(name, artifact, metrics, {"features": cols, "objective": objective},
                   len(played), seasons, FEATURE_VERSION)
@@ -232,27 +334,33 @@ def _train_defcon(train_df, valid_df, seasons, current_season) -> dict:
     k = rates_mod.fit_dispersion(played["defensive_contribution"].to_numpy(), expected)
     model = rates_mod.DefconModel(rate_model=rate_model, dispersion=k)
 
-    metrics: dict = {"train_rows": len(played), "dispersion": k}
+    metrics: dict = {"train_rows": len(played), "dispersion": k,
+                     "holdout": _holdout_span(valid_df),
+                     "trained_through": _last_key(train_df)}
     vd = valid_df[(valid_df["minutes"].fillna(0) >= 30) & valid_df["defensive_contribution"].notna()]
     if len(vd) > 30:
         from ..defaults import DEFCON_THRESHOLD
 
-        actual = np.array([
-            int(row["defensive_contribution"] >= DEFCON_THRESHOLD.get(row["position"], 12))
-            for row in vd.to_dict("records")
-        ])
-        probs = np.array([
-            model.p_threshold(row, row["position"], row["minutes"] or 0)
-            for row in vd.to_dict("records")
-        ])
-        metrics["log_loss"] = log_loss(actual, probs)
-        metrics["threshold_base_rate"] = float(actual.mean())
+        def _hit(rows) -> np.ndarray:
+            return np.array([
+                int(r["defensive_contribution"] >= DEFCON_THRESHOLD.get(r["position"], 12))
+                for r in rows
+            ])
+
+        def score(m, d=None) -> dict:
+            rows = (vd if d is None else d).to_dict("records")
+            probs = np.array([m.p_threshold(r, r["position"], r["minutes"] or 0) for r in rows])
+            return {"log_loss": log_loss(_hit(rows), probs)}
+
+        metrics.update(score(model))
+        metrics["threshold_base_rate"] = float(_hit(vd.to_dict("records")).mean())
+        metrics["head_to_head"] = _head_to_head("defcon", score, vd, model)
     save_artifact("defcon", model, metrics, {"features": rates_mod.DEFCON_FEATURES},
                   len(played), seasons, FEATURE_VERSION)
     return metrics
 
 
-def _train_bonus(train_df, valid_df, seasons, current_season) -> dict:
+def _train_bonus(df, train_df, valid_df, seasons, current_season) -> dict:
     """Historic + current-season models, blended by sample size (docs/06 model 4)."""
     played = train_df[(train_df["minutes"].fillna(0) > 0) & train_df["bps"].notna()]
     if len(played) < MIN_ROWS:
@@ -263,8 +371,14 @@ def _train_bonus(train_df, valid_df, seasons, current_season) -> dict:
                                   weights=_weights(played, current_season))
 
     # The 2026/27 retune means older coefficients are biased, so fit the new regime alone.
+    # Read current-season rows from the full frame, not train_df: early in a season the
+    # walk-forward holdout (`_split`) swallows every played GW, which used to pin
+    # n_current_fixtures to 0 and keep the blend disengaged until ~GW6.
+    # ponytail: the current model scoring against rows it saw is accepted — it is a
+    # regime probe on this season's evidence only, not the walk-forward metric.
     current = None
-    cur_rows = played[played["season_id"] == current_season]
+    cur_rows = df[(df["season_id"] == current_season)
+                  & (df["minutes"].fillna(0) > 0) & df["bps"].notna()]
     n_current = int(cur_rows["fixture_key"].nunique())
     if len(cur_rows) >= 150:
         current = bonus_mod.train_bps(
@@ -275,15 +389,20 @@ def _train_bonus(train_df, valid_df, seasons, current_season) -> dict:
 
     model = bonus_mod.BonusModel(historic=historic, current=current, n_current_fixtures=n_current)
     metrics: dict = {"train_rows": len(played), "n_current_fixtures": n_current,
-                     "blend_weight": model.blend_weight, "regime_warning": model.regime_warning}
+                     "blend_weight": model.blend_weight, "regime_warning": model.regime_warning,
+                     "holdout": _holdout_span(valid_df),
+                     "trained_through": _last_key(train_df)}
     vd = valid_df[(valid_df["minutes"].fillna(0) > 0) & valid_df["bps"].notna()]
     if len(vd) > 30:
-        pred = np.array([
-            model.expected_bps(row, row["position"], row["minutes"] or 0)
-            for row in vd.to_dict("records")
-        ])
-        metrics["mae"] = mae(vd["bps"].to_numpy(), pred)
-        metrics["spearman"] = spearman(vd["bps"].to_numpy(), pred)
+
+        def score(m, d=None) -> dict:
+            d = vd if d is None else d
+            rows = d.to_dict("records")
+            pred = np.array([m.expected_bps(r, r["position"], r["minutes"] or 0) for r in rows])
+            return {"mae": mae(d["bps"].to_numpy(), pred), "spearman": spearman(d["bps"].to_numpy(), pred)}
+
+        metrics.update(score(model))
+        metrics["head_to_head"] = _head_to_head("bonus", score, vd, model)
     save_artifact("bonus", model, metrics, {"features": bonus_mod.BPS_FEATURES},
                   len(played), seasons, FEATURE_VERSION)
     return metrics

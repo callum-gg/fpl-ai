@@ -67,8 +67,13 @@ def embed_pending(limit: int = 200) -> int:
         return 0
     vectors = encode([r["text"] for r in rows])
     if vectors is None:
-        # No encoder: mark them done so FTS-only search still works and the queue drains.
+        # No encoder: still fill the lexical index, then mark done so the queue drains.
         with writer() as conn:
+            for row in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunk_fts(rowid, text) VALUES(?,?)",
+                    (row["id"], row["text"]),
+                )
             conn.executemany(
                 "UPDATE doc_chunks SET embedded=1 WHERE id=?", [(r["id"],) for r in rows]
             )
@@ -89,9 +94,11 @@ def embed_pending(limit: int = 200) -> int:
                     (row["id"], blob),
                 )
             conn.execute("UPDATE doc_chunks SET embedded=1 WHERE id=?", (row["id"],))
+            # ponytail: FTS5 virtual tables reject ON CONFLICT; OR IGNORE is the
+            # equivalent upsert-do-nothing and is idempotent on external-content FTS5.
             conn.execute(
-                "INSERT INTO chunk_fts(rowid, text) VALUES(?,?) "
-                "ON CONFLICT DO NOTHING", (row["id"], row["text"])
+                "INSERT OR IGNORE INTO chunk_fts(rowid, text) VALUES(?,?)",
+                (row["id"], row["text"]),
             )
     return len(rows)
 

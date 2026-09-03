@@ -279,3 +279,83 @@ def test_scrape_kill_switch_disables_scrapers(monkeypatch):
     assert CONNECTORS["understat"].unavailable_reason(off) == "SCRAPE_ENABLED=false"
     # The FPL API is not a scraper, so the kill switch must not touch it.
     assert CONNECTORS["fpl_official"].is_available(off)
+
+
+def test_a_connector_that_fetches_nothing_is_not_recorded_as_ok(seeded_season):
+    """`understat`, `fbref` and `setpieces` each logged a clean `ok` with zero requests and
+    zero rows, so 2026-27 had no xG at all while every dashboard read healthy."""
+    import asyncio
+
+    from fplai.connectors.base import Connector, IngestContext, run_connector
+    from fplai.db.engine import query_one
+
+    class Silent(Connector):
+        id = "understat"          # a real source id, so the FK on ingest_runs holds
+
+        async def fetch(self, ctx: IngestContext):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    result = asyncio.run(run_connector(Silent(), seeded_season))
+    assert result.status == "empty"
+    assert result.requests_made == 0
+
+    row = query_one(
+        "SELECT status, rows_upserted FROM ingest_runs WHERE source_id='understat' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert row["status"] == "empty" and row["rows_upserted"] == 0
+
+
+def test_a_connector_that_yields_a_document_is_still_ok(seeded_season):
+    import asyncio
+
+    from fplai.connectors.base import Connector, IngestContext, RawDoc, run_connector
+
+    class Talkative(Connector):
+        id = "fbref"
+
+        async def fetch(self, ctx: IngestContext):
+            yield RawDoc("article", "something real happened", url="http://x/notempty")
+
+    assert asyncio.run(run_connector(Talkative(), seeded_season)).status == "ok"
+
+
+def test_a_connector_that_parses_nothing_is_flagged_too(seeded_season):
+    """The subtler no-op: `understat` fetched its page fine and parsed it into zero rows,
+    which is why 2026-27 has no xG while every historical season does."""
+    import asyncio
+
+    from fplai.connectors.base import (
+        Connector,
+        IngestContext,
+        ParsedBatch,
+        RawDoc,
+        run_connector,
+    )
+
+    class Fruitless(Connector):
+        id = "understat"
+
+        async def fetch(self, ctx: IngestContext):
+            yield RawDoc("stats", {"rows": []}, url="http://x/fruitless")
+
+        def parse(self, doc: RawDoc) -> ParsedBatch:
+            return ParsedBatch()          # overrides parse, but writes nothing
+
+    assert asyncio.run(run_connector(Fruitless(), seeded_season)).status == "empty"
+
+
+def test_an_archive_only_connector_writing_no_rows_is_normal(seeded_season):
+    """rss_news and transcripts archive text for the LLM pass; zero rows is their good day."""
+    import asyncio
+
+    from fplai.connectors.base import Connector, IngestContext, RawDoc, run_connector
+
+    class ArchiveOnly(Connector):
+        id = "rss_news"          # does not override parse
+
+        async def fetch(self, ctx: IngestContext):
+            yield RawDoc("article", "a story worth keeping", url="http://x/archive-only")
+
+    assert asyncio.run(run_connector(ArchiveOnly(), seeded_season)).status == "ok"

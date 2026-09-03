@@ -22,6 +22,22 @@ DEFCON_POINTS = 2
 
 POSITION_BY_ELEMENT_TYPE = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 
+# FPL scores exactly four positions, but historical feeds do not all agree on that: the
+# 2024-25 archive labels 20 players `AM`, which is enough to raise KeyError out of the
+# simulator's scoring dicts and abort a whole gameweek — every 2024-25 backtest gameweek
+# died this way. Anything unrecognised scores as a midfielder, which is what FPL does with
+# an attacking midfielder anyway.
+POSITION_ALIASES = {"AM": "MID", "DM": "MID", "CM": "MID", "WB": "DEF", "CB": "DEF",
+                    "LB": "DEF", "RB": "DEF", "ST": "FWD", "CF": "FWD", "GKP": "GK"}
+
+
+def normalise_position(position: str | None) -> str:
+    """One of GK/DEF/MID/FWD, whatever the source called it."""
+    p = (position or "").strip().upper()
+    if p in POSITION_BY_ELEMENT_TYPE.values():
+        return p
+    return POSITION_ALIASES.get(p, "MID")
+
 # --- Seed source registry (docs/02-data-sources.md) -------------------------------
 # (id, display_name, category, requires_key, enabled_by_default, base_url, rate_limit/min)
 SEED_SOURCES: list[tuple] = [

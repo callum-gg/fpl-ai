@@ -117,17 +117,32 @@ def init_db() -> None:
 
 @contextmanager
 def writer() -> Iterator[sqlite3.Connection]:
-    """All writes funnel through here (01-architecture.md: single writer, zero lock errors)."""
+    """All writes funnel through here (01-architecture.md: single writer, zero lock errors).
+
+    Reentrant on one thread: a nested writer() joins the outer transaction instead of
+    re-acquiring _write_lock — which self-deadlocked the event loop when a parse inside
+    run_connector's writer queued an entity review that opened its own writer.
+    """
     conn = get_conn()
+    if getattr(_local, "depth", 0):
+        _local.depth += 1
+        try:
+            yield conn
+        finally:
+            _local.depth -= 1
+        return
     with _write_lock:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            _local.depth = 1
             yield conn
         except Exception:
             conn.execute("ROLLBACK")
             raise
         else:
             conn.execute("COMMIT")
+        finally:
+            _local.depth = 0
 
 
 def query(sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:

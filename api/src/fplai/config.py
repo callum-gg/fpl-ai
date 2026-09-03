@@ -15,6 +15,15 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE)
 
+# api/src/fplai/config.py -> fplai -> src -> api -> the repo root, which is also /app in
+# the container. Relative data paths anchor here rather than on whatever directory the
+# process happened to start in.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _anchored(p: Path) -> Path:
+    return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+
 
 def _csv(v: str | list[str] | None) -> list[str]:
     if v is None:
@@ -146,14 +155,28 @@ class Settings(BaseSettings):
             return [int(x) for x in _csv(v)]
         return v
 
+    @field_validator("data_dir", mode="after")
+    @classmethod
+    def _anchor_data_dir(cls, v: Path) -> Path:
+        """Resolve a relative data dir against the repo root, never the shell's cwd.
+
+        `get_settings()` mkdirs this eagerly, so with the default `./data` every process
+        that imported fplai from somewhere else quietly grew its own state tree there —
+        which is how 394 MB of stray database ended up at `api/src/data/fplai.db` and how
+        a run could read a database nobody was writing to.
+        """
+        return _anchored(v)
+
     @property
     def db_path(self) -> Path:
         url = self.database_url
         if url.startswith("sqlite:///"):
-            return Path(url.removeprefix("sqlite:///"))
-        if url.startswith("sqlite://"):
-            return Path(url.removeprefix("sqlite://"))
-        return Path(url)
+            raw = Path(url.removeprefix("sqlite:///"))
+        elif url.startswith("sqlite://"):
+            raw = Path(url.removeprefix("sqlite://"))
+        else:
+            raw = Path(url)
+        return _anchored(raw)
 
     @property
     def raw_dir(self) -> Path:

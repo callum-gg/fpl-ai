@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 
 import httpx
-
 from fplai.keycheck import _probe, verify_all
 
 
@@ -45,5 +44,32 @@ def test_verify_all_skips_everything_when_no_keys_are_set(monkeypatch):
     from fplai import keycheck
     from fplai.config import Settings
 
-    monkeypatch.setattr(keycheck, "get_settings", lambda: Settings())
+    # Settings() reads the local .env AND OS environment variables, so on any machine
+    # with credentials configured this test wasn't actually keyless and probed live
+    # services. Blank every credential source before constructing it.
+    for name in Settings.model_fields:
+        monkeypatch.delenv(name.upper(), raising=False)
+    monkeypatch.setattr(keycheck, "get_settings", lambda: Settings(_env_file=None))
     assert asyncio.run(verify_all()) == []
+
+
+def test_relative_data_paths_anchor_on_the_repo_not_the_working_directory(monkeypatch):
+    """`get_settings()` mkdirs data_dir eagerly, so a relative default meant every process
+    that imported fplai from elsewhere grew its own state tree — which is how a 394 MB
+    stray database ended up at api/src/data/fplai.db while the real one sat in data/."""
+    from fplai.config import PROJECT_ROOT, Settings
+
+    for var in ("DATA_DIR", "DATABASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+    s = Settings(_env_file=None)
+    assert s.data_dir.is_absolute()
+    assert s.data_dir == PROJECT_ROOT / "data"
+    assert s.db_path.is_absolute()
+    assert s.db_path == PROJECT_ROOT / "data" / "fplai.db"
+    assert s.models_dir == PROJECT_ROOT / "data" / "models"
+
+    # An absolute setting is always honoured as given.
+    absolute = Settings(_env_file=None, data_dir="/tmp/elsewhere",
+                        database_url="sqlite:////tmp/elsewhere/x.db")
+    assert str(absolute.data_dir).replace("\\", "/").endswith("/tmp/elsewhere")

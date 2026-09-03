@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from ..db.engine import jdump, query, query_one, utcnow, writer
+from ..defaults import normalise_position
 from ..db.settings_store import global_settings
 from ..features.build import build_ctx, deadline_of
 from ..features.registry import compute_all
@@ -108,7 +109,7 @@ def build_inputs(
                     continue
                 f = compute_all(ctx)
                 feature_cache[pid] = f
-                position = positions.get(pid, ctx.position)
+                position = normalise_position(positions.get(pid, ctx.position))
                 team_lambda = lh if team_id == fx["home_team_id"] else la
 
                 mp = _minutes_for(minutes_artifact, ctx, f, fx["id"], pid)
@@ -132,7 +133,9 @@ def build_inputs(
                         saves90=rate_models.saves90(f, position),
                         cards90=rate_models.cards90(f, position),
                         exp_bps=bonus_model.expected_bps(f, position, 90.0),
-                        rotation_sensitivity=1.0 + 0.5 * (f.get("manager_rotation_index") or 0.0),
+                        # ponytail: every squad shares one rotation shock at the league-average
+                        # weight. Per-manager churn needs team XI history in FeatureCtx; the
+                        # feature that claimed to supply it never produced a single value.
                     )
                 )
         out.append(fi)
@@ -213,8 +216,10 @@ def run(
                     "exp_defcon_points": float(comp["defcon_points"].mean())
                     if "defcon_points" in comp else None,
                     "exp_bonus": float(comp["bonus"].mean()) if "bonus" in comp else None,
-                    "exp_cards_penalty": None,
-                    "exp_conceded_penalty": None,
+                    "exp_cards_penalty": float(comp["cards_penalty"].mean())
+                    if "cards_penalty" in comp else None,
+                    "exp_conceded_penalty": float(comp["conceded_penalty"].mean())
+                    if "conceded_penalty" in comp else None,
                     "exp_points": base,
                     "sd_points": s["sd_points"],
                     "p10": s["p10"],

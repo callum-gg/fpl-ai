@@ -412,3 +412,74 @@ def feature_explanations(player_id: int, season_id: str, gameweek: int) -> list[
             }
         )
     return sorted(out, key=lambda x: (x["group"], x["name"]))
+
+
+# --- coverage audit ---------------------------------------------------------------
+
+
+def declared_features() -> dict[str, list[str]]:
+    """Every feature name each model asks for at predict time, by model."""
+    from ..models import bonus as bonus_mod
+    from ..models import minutes as minutes_mod
+    from ..models import rates as rates_mod
+
+    return {
+        "minutes": minutes_mod.FEATURES,
+        "goals90": rates_mod.GOALS_FEATURES,
+        "assists90": rates_mod.ASSISTS_FEATURES,
+        "saves90": rates_mod.SAVES_FEATURES,
+        "cards90": rates_mod.CARDS_FEATURES,
+        "defcon": rates_mod.DEFCON_FEATURES,
+        "bonus": bonus_mod.BPS_FEATURES,
+    }
+
+
+def audit_coverage(season_id: str, gameweek: int) -> dict:
+    """What the models ask for versus what the store actually holds for one gameweek.
+
+    A model declaring a feature nothing ever writes is invisible at every other layer: the
+    builder returns None, `build_gameweek` skips None, the column never appears, and the
+    booster trains on a gap it cannot report. `manager_rotation_index` sat like that through
+    GW1-2 while scaling the simulator's rotation shock, and `days_since_team_match` — the
+    guard that stops an unused substitute being priced as a nailed starter — was written,
+    unit-tested against a hand-built dict, and never once computed.
+
+    Four verdicts. Only the first is a defect; the rest need a human to say which:
+      `unwired`       declared by a model, no builder and no block indicator — nothing can
+                      ever compute it, so this is always a bug
+      `never_written` has a builder but zero rows in the whole store — either its source is
+                      unconfigured (odds, lineups) or the builder always returns None
+      `absent`        rows exist for other gameweeks, none for this one
+      `constant`      present but single-valued here, so no model can split on it
+    """
+    from .registry import BLOCK_INDICATORS, REGISTRY
+
+    declared: set[str] = {n for names in declared_features().values() for n in names}
+
+    here = {
+        r["name"]: (r["n"], r["d"])
+        for r in query(
+            "SELECT name, COUNT(*) n, COUNT(DISTINCT value) d FROM feature_values "
+            "WHERE season_id=? AND gameweek=? GROUP BY name",
+            (season_id, gameweek),
+        )
+    }
+    ever = {r["name"] for r in query("SELECT DISTINCT name FROM feature_values")}
+    buildable = set(REGISTRY) | set(BLOCK_INDICATORS)
+
+    unwired = sorted(n for n in declared if n not in buildable)
+    never_written = sorted(n for n in declared if n in buildable and n not in ever)
+    absent = sorted(n for n in declared if n in ever and n not in here)
+    constant = sorted(n for n, (_c, d) in here.items() if d <= 1)
+
+    return {
+        "season_id": season_id,
+        "gameweek": gameweek,
+        "declared": len(declared),
+        "present": len(here),
+        "unwired": unwired,
+        "never_written": never_written,
+        "absent": absent,
+        "constant": constant,
+        "healthy": not unwired,
+    }

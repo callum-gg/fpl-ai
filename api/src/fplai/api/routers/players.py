@@ -137,11 +137,13 @@ def get_player(player_id: int) -> dict:
     if row is None:
         raise HTTPException(404, {"error": {"code": "not_found", "message": "player not found"}})
     d = dict(row)
-    d["price"] = query_one(
+    # Must be a plain dict: a nested sqlite3.Row breaks pydantic response serialisation.
+    price_row = query_one(
         "SELECT price, selected_by_percent FROM player_prices WHERE player_id=? AND season_id=? "
         "ORDER BY observed_at DESC LIMIT 1",
         (player_id, season),
     )
+    d["price"] = dict(price_row) if price_row else None
     d["availability"] = [
         dict(r) for r in query(
             "SELECT * FROM availability WHERE player_id=? ORDER BY observed_at DESC LIMIT 8",

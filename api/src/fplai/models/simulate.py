@@ -31,8 +31,11 @@ from .team_goals import score_matrix
 
 log = logging.getLogger(__name__)
 
+# .get(..., MID) at the call sites: an unrecognised position from a historical feed
+# must not raise out of the middle of a simulation and lose the whole gameweek.
 GOAL_POINTS = {"GK": 10, "DEF": 6, "MID": 5, "FWD": 4}
 CS_POINTS = {"GK": 4, "DEF": 4, "MID": 1, "FWD": 0}
+ASSIST_RATE = 0.90  # share of goals with an FPL assist (DB-wide 2020/21-2025/26)
 
 
 @dataclass
@@ -128,8 +131,10 @@ def simulate_gameweek(
                 starts = latent >= start_cut
                 cameos = (~starts) & (latent >= cameo_cut)
                 m = np.zeros(n_sims)
-                m[starts] = np.clip(rng.normal(p.exp_minutes if p.p_start > 0.5 else 78, 14,
-                                               starts.sum()), 1, 90)
+                # E[minutes | start] is 78 (EXP_MINUTES_IF_START), not the unconditional
+                # exp_minutes = p_start*78 + p_cameo*19 — feeding that in deflated starter
+                # minutes for every 0.4 < p_start < 0.6 player (CS/attack shares with it).
+                m[starts] = np.clip(rng.normal(78.0, 14, starts.sum()), 1, 90)
                 m[cameos] = np.clip(rng.normal(19, 9, cameos.sum()), 1, 45)
                 mins[p.player_id] = m
                 played[p.player_id] = m > 0
@@ -142,8 +147,10 @@ def simulate_gameweek(
             wg = share_g[:, None] * minute_share
             wa = share_a[:, None] * minute_share
             goals_alloc = _multinomial_by_column(rng, own_goals, wg)
-            # Assists cannot exceed goals; roughly 70% of goals are assisted.
-            assisted = rng.binomial(own_goals, 0.70)
+            # Assists cannot exceed goals; ~90% of goals carry an FPL assist (measured
+            # 0.89-0.94 across 2020/21-2025/26 in this DB — Opta-style 0.70 is the wrong
+            # definition for FPL scoring).
+            assisted = rng.binomial(own_goals, ASSIST_RATE)
             assists_alloc = _multinomial_by_column(rng, assisted, wa)
 
             clean_sheet = conceded == 0
@@ -156,19 +163,22 @@ def simulate_gameweek(
 
                 g = goals_alloc[i]
                 a = assists_alloc[i]
-                pts += GOAL_POINTS[p.position] * g
+                pts += GOAL_POINTS.get(p.position, GOAL_POINTS['MID']) * g
                 pts += 3 * a
 
                 if p.position in ("GK", "DEF", "MID"):
-                    pts += CS_POINTS[p.position] * (clean_sheet & (m >= 60))
+                    pts += CS_POINTS.get(p.position, CS_POINTS['MID']) * (clean_sheet & (m >= 60))
+                conceded_penalty = np.zeros(n_sims)
                 if p.position in ("GK", "DEF"):
-                    pts -= conceded // 2 * on
+                    conceded_penalty = conceded // 2 * on
+                    pts -= conceded_penalty
 
                 # --- 4. DefCon, saves, cards -----------------------------------------
+                # One rate per draw, not the mean of them: he racks up DefCon actions in
+                # the sims where he plays 90 and none in the sims where he doesn't, and
+                # averaging first throws away exactly the tail that clears the threshold.
                 mu_defcon = p.defcon_rate90 * (m / 90.0)
-                actions = nb_sample(rng, float(max(mu_defcon.mean(), 1e-6)),
-                                    p.defcon_dispersion, n_sims)
-                actions = (actions * np.where(mu_defcon > 0, 1, 0)).astype(int)
+                actions = nb_sample(rng, mu_defcon, p.defcon_dispersion, n_sims)
                 hit = actions >= DEFCON_THRESHOLD.get(p.position, 12)
                 defcon_pts = DEFCON_POINTS * hit * on
                 pts += defcon_pts
@@ -181,14 +191,18 @@ def simulate_gameweek(
                     saves = np.zeros(n_sims, dtype=int)
 
                 yellows = rng.poisson(np.maximum(0, p.cards90 * m / 90.0))
-                pts -= np.minimum(yellows, 1)
                 reds = rng.binomial(1, EMPIRICAL_RATES["red_card_per_90"], n_sims) * on
-                pts -= 3 * reds
+                cards_penalty = np.minimum(yellows, 1) + 3 * reds
+                pts -= cards_penalty
                 pts -= 2 * rng.binomial(1, EMPIRICAL_RATES["own_goal_per_90"], n_sims) * on
 
                 components[p.player_id] = {
                     "goals": g, "assists": a, "clean_sheet": clean_sheet & (m >= 60),
                     "defcon_points": defcon_pts, "saves": saves,
+                    # Both of these reached `predictions` as NULL on every row ever written,
+                    # so the UI could show what a player was expected to earn but never what
+                    # the model expected him to lose.
+                    "cards_penalty": cards_penalty, "conceded_penalty": conceded_penalty,
                 }
                 points[p.player_id] = pts
                 minutes[p.player_id] = m

@@ -9,11 +9,53 @@ import {
   useHealth,
   useRecommend,
   useRecommendations,
+  type Recommendation,
 } from "../lib/api";
 import { useSquadStore } from "../stores/squad";
 import { Card, Delta, DistributionBar, Empty, ErrorNote, Loading, PlayerName, PlayerRow, PositionBadge } from "../components/ui";
 
 const VARIANTS = ["safe", "balanced", "aggressive"] as const;
+
+const CHIP_LABEL: Record<string, string> = {
+  wildcard: "Wildcard",
+  freehit: "Free Hit",
+  bboost: "Bench Boost",
+  "3xc": "Triple Captain",
+};
+
+/** Loud when the app wants a chip played THIS week; quiet line for a later-horizon
+ * plan. A chip suggestion must be impossible to miss — it changes the whole week. */
+function ChipCallout({ payload }: { payload: Recommendation["payload"] }) {
+  const cal = payload.chip_calendar?.find((c) => c.chip === payload.chip);
+  const label = CHIP_LABEL[payload.chip ?? ""] ?? payload.chip;
+  const later = payload.future_gameweeks?.filter((g) => g.chip) ?? [];
+  if (!payload.chip && later.length === 0) return null;
+  return (
+    <div className="space-y-2 mt-3">
+      {payload.chip && (
+        <div className="rounded-lg border border-pos/40 bg-pos/10 px-4 py-3">
+          <p className="font-semibold text-pos text-base">
+            ▶ Play {label} in GW{payload.gameweek}
+          </p>
+          {(cal?.reason || cal?.actionable) && (
+            <p className="text-sm text-muted mt-1">
+              {cal?.reason}
+              {cal?.actionable ? ` · calendar: best spot GW${cal.best_gw} (+${cal.gain})` : ""}
+            </p>
+          )}
+        </div>
+      )}
+      {later.map((g) => (
+        <div key={g.gameweek} className="rounded-lg border border-line px-4 py-2.5">
+          <p className="text-sm text-slate-300">
+            <span className="text-warn font-medium">{CHIP_LABEL[g.chip ?? ""] ?? g.chip}</span>{" "}
+            planned for GW{g.gameweek}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function Dashboard() {
   const { activeSquadId, variant, setVariant } = useSquadStore();
@@ -72,6 +114,8 @@ export default function Dashboard() {
             </div>
 
             <p className="text-lg leading-snug">{rec.payload.headline}</p>
+
+            <ChipCallout payload={rec.payload} />
 
             {rec.payload.recommendation === "do_nothing" && (
               <p className="mt-2 text-sm text-warn">
