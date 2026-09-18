@@ -291,3 +291,25 @@ def test_the_plan_says_when_a_trained_model_will_not_load(seeded_season):
         )
     clear_cache()
     assert "minutes could not be loaded" in " ".join(_data_warnings(seeded_season, 1, []))
+
+
+def test_a_fixture_from_an_older_run_is_not_summed_as_a_double(seeded_season, player_pool):
+    """A player who changed club keeps his old-club row in older runs. Only the newest run
+    counts, while a genuine double gameweek (both legs in that run) still sums."""
+    from fplai.db.engine import writer
+    from fplai.models.predict import horizon_points
+
+    mover, dgw = player_pool[0], player_pool[1]
+    rows = [(mover, 44, "2026-08-27T00:00:00+00:00", 3.4),   # pre-move fixture, old run
+            (mover, 46, "2026-09-18T00:00:00+00:00", 3.1),   # new club, newest run
+            (dgw, 46, "2026-09-18T00:00:00+00:00", 3.0),
+            (dgw, 47, "2026-09-18T00:00:00+00:00", 2.5)]
+    with writer() as conn:
+        conn.executemany(
+            "INSERT INTO predictions(player_id,season_id,gameweek,fixture_key,generated_at,"
+            "exp_points) VALUES(?,?,7,?,?,?)",
+            [(p, seeded_season, fk, g, xp) for p, fk, g, xp in rows],
+        )
+    hp = horizon_points(seeded_season, 7, 1)
+    assert hp[mover] == [3.1]
+    assert hp[dgw] == [5.5]
