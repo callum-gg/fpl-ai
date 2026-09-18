@@ -35,7 +35,15 @@ PRAGMAS = (
     "PRAGMA foreign_keys = ON",
     "PRAGMA busy_timeout = 30000",
     "PRAGMA temp_store = MEMORY",
-    "PRAGMA mmap_size = 268435456",
+    # ponytail: mmap deliberately OFF, not tuned down. The DB lives on a Docker Desktop
+    # bind mount (gRPC-FUSE), and the host reads the same file while the container writes
+    # it. SQLite only guarantees mmap I/O on filesystems where the mapping is coherent
+    # with write() -- FUSE/network mounts are the documented exception, and an incoherent
+    # mapping hands the pager stale pages that it then writes back as real ones. That is
+    # what "invalid page number" / "2nd reference to page" in integrity_check means, and
+    # it ate this DB on 2026-09-04 and again on 2026-09-12. Set it back to 256MB only if
+    # the file ever moves onto a real local filesystem (a named volume).
+    "PRAGMA mmap_size = 0",
 )
 
 # Additive schema changes made after a release. Each is (id, sql); failures on
