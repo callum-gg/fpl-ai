@@ -1,7 +1,8 @@
 """Model 1 — team goals. Bivariate Poisson with Dixon-Coles, blended with the market.
 
-Attack/defence strengths are time-decayed latent parameters (half-life ~60 matches),
-home advantage is fitted, promoted sides shrink toward the league mean.
+Attack/defence strengths are time-decayed latent parameters (half-life ~300 league
+matches, i.e. ~30 per club), home advantage is fitted, promoted sides shrink toward the
+league mean.
 
 Then the market gets the final say where it exists:
     lambda_final = lambda_model^(1-w) * lambda_odds^w,   w ~ 0.65
@@ -24,7 +25,16 @@ from ..db.settings_store import global_settings
 
 log = logging.getLogger(__name__)
 
-HALF_LIFE_MATCHES = 60.0
+# Both counted in *league* matches and weighted-likelihood units. The decay indexes the
+# league-wide match list, so the old 60 was ~6 matches per club: four gameweeks of a new
+# season outweighed the whole of the last one, and a ridge of 0.02 could not hold a
+# promoted side with four games of history — Coventry went into GW5 2026-27 priced at
+# 0.15 xG away while the market said 0.90. Walk-forward over 1,480 matches (GW1-10, 20
+# and 30 of 2023-24..2025-26, GW1-4 of 2026-27), mean scoreline NLL per match:
+#   60/0.02 3.015 (GW1-6: 3.110)   150/1.0 2.888 (2.909)   300/1.0 2.873 (2.884)
+#   600/1.0 2.876 (2.888)          300/5.0 2.875 (2.893)
+HALF_LIFE_MATCHES = 300.0
+RIDGE = 1.0
 MAX_GOALS = 9
 
 
@@ -156,7 +166,7 @@ def fit(season_ids: list[str], as_of: str | None = None) -> TeamModel:
         tau[m11] = 1 - rho
         tau = np.clip(tau, 1e-6, None)
         # Ridge on the strengths shrinks promoted sides toward the league mean.
-        penalty = 0.02 * (np.sum(attack**2) + np.sum(defence**2))
+        penalty = RIDGE * (np.sum(attack**2) + np.sum(defence**2))
         return -float(np.sum(decay * (ll + np.log(tau)))) + penalty
 
     x0 = np.concatenate([np.zeros(2 * n), [0.26, -0.05, 0.15]])

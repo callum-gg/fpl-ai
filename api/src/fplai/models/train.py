@@ -220,8 +220,8 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
             "rho": tm.rho,
         }
         save_artifact("team_goals", tm.to_dict(), results["team_goals"],
-                      {"half_life_matches": team_mod.HALF_LIFE_MATCHES}, len(df), seasons,
-                      FEATURE_VERSION)
+                      {"half_life_matches": team_mod.HALF_LIFE_MATCHES, "ridge": team_mod.RIDGE},
+                      len(df), seasons, FEATURE_VERSION)
 
     if "minutes" in wanted:
         results["minutes"] = _train_minutes(train_df, valid_df, seasons, settings.current_season)
