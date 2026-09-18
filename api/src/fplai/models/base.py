@@ -13,7 +13,7 @@ import math
 import pickle
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
@@ -364,11 +364,16 @@ def _resolve_artefact(stored: str) -> Path | None:
     then warns and returns None, and every caller quietly degrades to its heuristic — the
     app keeps serving numbers that no longer come from the trained model. The filename is
     the stable part, so fall back to the configured models_dir.
+
+    The filename is taken with PureWindowsPath, which splits on both separators. A
+    PosixPath does not split on `\\`, so a host-trained `T:\\FPL\\data\\models\\x.pkl`
+    has the whole string as its `.name` on Linux — which is how every trained model sat
+    unused in the container from 2026-09-03 while GW3-5 were predicted on heuristics.
     """
     path = Path(stored)
     if path.is_file():
         return path
-    local = Path(get_settings().models_dir) / path.name
+    local = Path(get_settings().models_dir) / PureWindowsPath(stored).name
     return local if local.is_file() else None
 
 

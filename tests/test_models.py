@@ -454,6 +454,20 @@ def test_season_weighting_decays_with_age():
     assert season_weight("2016-17", "2026-27") < 0.05
 
 
+def test_an_artefact_trained_on_the_other_os_still_resolves(monkeypatch):
+    """A host-trained Windows path must find the file in models_dir on Linux, and vice
+    versa. Getting this wrong fails silently: every model degrades to its heuristic."""
+    from fplai.config import get_settings
+    from fplai.models.base import _resolve_artefact
+
+    models_dir = get_settings().models_dir
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "minutes-1.pkl").write_bytes(b"x")
+    for stored in (r"T:\FPL\data\models\minutes-1.pkl", "/app/data/models/minutes-1.pkl"):
+        assert _resolve_artefact(stored) == models_dir / "minutes-1.pkl"
+    assert _resolve_artefact(r"T:\FPL\data\models\gone-1.pkl") is None
+
+
 def test_calibration_metrics_behave():
     from fplai.models.base import ece, log_loss, spearman
 

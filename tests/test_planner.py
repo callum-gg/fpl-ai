@@ -273,3 +273,21 @@ def test_the_plan_says_when_it_is_flying_without_the_market(seeded_season, playe
     stale = warnings()
     assert "No match odds" not in stale
     assert "old" in stale and "odds" in stale.lower()
+
+
+def test_the_plan_says_when_a_trained_model_will_not_load(seeded_season):
+    """GW3-5 of 2026-27 were planned on heuristics because every active artefact was
+    unreadable in the container, and nothing but a log line said so."""
+    from fplai.db.engine import writer
+    from fplai.models.base import clear_cache
+    from fplai.optimiser.recommend import _data_warnings
+
+    with writer() as conn:
+        conn.execute(
+            "INSERT INTO model_versions(model_name,version,trained_at,train_rows,"
+            "train_seasons,metrics_json,params_json,artefact_path,feature_version,is_active) "
+            "VALUES('minutes','gone','2026-09-01T00:00:00+00:00',1,'[]','{}','{}',"
+            "'/nowhere/minutes-gone.pkl',1,1)"
+        )
+    clear_cache()
+    assert "minutes could not be loaded" in " ".join(_data_warnings(seeded_season, 1, []))
