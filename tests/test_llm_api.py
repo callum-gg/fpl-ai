@@ -368,3 +368,39 @@ def test_trust_weight_is_available_to_non_video_sources(seeded_season, db):
     with writer() as conn:
         conn.execute("UPDATE sources SET trust_weight=1.0 WHERE id='rss_news'")
     assert query_one("SELECT trust_weight FROM sources WHERE id='rss_news'")["trust_weight"] == 1.0
+
+
+def test_extraction_skips_thinking_and_never_replays_a_truncated_answer(monkeypatch):
+    """Over half of this season's extraction calls spent their whole budget reasoning and
+    returned no JSON. Extraction must ask for no thinking, and a cached call that never
+    produced its JSON must be retried, not replayed as 'no claims'."""
+    import asyncio
+
+    import httpx
+    from fplai.llm import client as llm
+    from fplai.llm.tasks import get
+
+    sent = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"claims": []}'}}], "usage": {}}
+
+    async def _post(self, url, **kw):
+        sent.append(kw["json"])
+        return _Resp()
+
+    task = get("extract_claims")
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr(llm, "_endpoint", lambda m: ("http://llm.test", "k", m))
+    monkeypatch.setattr(type(task), "model", lambda self: "test-model")
+    msgs = [{"role": "user", "content": "a chunk that once ran out of budget"}]
+    llm._log_call(task.name, "test-model", llm.prompt_hash(task.name, "test-model", msgs),
+                  {}, 1, False, True, None, {"text": "We need to extract...", "data": None})
+
+    r = asyncio.run(llm.complete(task, msgs))
+    assert not r.cached and r.data == {"claims": []}
+    assert sent[0]["chat_template_kwargs"] == {"enable_thinking": False}

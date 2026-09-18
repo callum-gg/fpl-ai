@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -260,7 +261,15 @@ async def extract_claims() -> dict:
     from ..llm.embed import embed_pending
     from ..llm.extract import drain
 
-    embedded = embed_pending(200)
+    # Search indexing must not gate extraction. A damaged vec0 table (the 2026-09-12
+    # recovery left one chunk's vector blob empty) raised here on every run, so no claim
+    # was extracted for a week and the injury/news layer went quiet without a single
+    # prediction saying so. The embed error is still reported in the result.
+    try:
+        embedded = embed_pending(200)
+    except sqlite3.Error as e:
+        log.warning("embedding failed, extracting anyway: %s", e)
+        embedded = f"failed: {e}"
     result = await drain(50, _season())
     return {**result, "embedded": embedded}
 
