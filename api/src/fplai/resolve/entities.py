@@ -142,19 +142,22 @@ def resolve_name(
         return Resolution(None, 0.0, "ambiguous")
 
     choices = [a for a, _ in cands]
-    matches = process.extract(n, choices, scorer=fuzz.token_set_ratio, limit=3)
+    matches = process.extract(n, choices, scorer=fuzz.token_set_ratio, limit=10)
     if not matches:
         return Resolution(None, 0.0, "miss")
     _, best_score, best_idx = matches[0]
-    runner_up = matches[1][1] if len(matches) > 1 else 0
     pid = cands[best_idx][1]
+    # The margin is against the best *other player*. Every player carries several aliases
+    # ("dalot", "diogo dalot teixeira"), so the raw runner-up was usually himself at the
+    # same score — and Bruno, Raya, Caicedo, Dalot all went to review instead of linking.
+    runner_up = max((s for _, s, i in matches if cands[i][1] != pid), default=0)
 
     if best_score >= AUTO_ACCEPT and best_score - runner_up >= 3:
         return Resolution(pid, best_score / 100, "fuzzy")
     if best_score >= REVIEW_FLOOR:
         if allow_review:
             _queue_review(surface, team_hint, [c[1] for c in cands
-                                               if c[0] in {m[0] for m in matches}])
+                                               if c[0] in {m[0] for m in matches[:3]}])
         return Resolution(None, best_score / 100, "review")
     return Resolution(None, best_score / 100, "miss")
 
@@ -211,3 +214,46 @@ def mention_candidates(text: str, season_id: str, limit: int = 40) -> list[dict]
         if surname and len(surname) > 2 and surname in n:
             out.append({"player_id": r["id"], "name": r["canonical_name"], "team": r["team"]})
     return out[:limit]
+
+
+def merge_players(conn, mapping: dict[int, int]) -> dict[str, int]:
+    """Fold duplicate `players` rows into a canonical one: {old_id: canonical_id}.
+
+    The same footballer could be two or more rows split across seasons (vaastav matched
+    by bare name, so "Petr Cech 1", a mis-encoded "Héctor Bellerín" or FPL renaming
+    someone each minted a new player), and every form feature lost its history at the
+    split. Every column with a foreign key to players is repointed; where that would
+    break a unique key the canonical row already has that fact, so the old copy goes.
+    Set-based through a temp table: feature_values alone is ~14M rows.
+    """
+    mapping = {o: c for o, c in mapping.items() if o != c}
+    if not mapping:
+        return {}
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _merge(old INTEGER PRIMARY KEY, canon INTEGER)")
+    conn.execute("DELETE FROM _merge")
+    conn.executemany("INSERT INTO _merge VALUES(?,?)", list(mapping.items()))
+    moved: dict[str, int] = {}
+    tables = [r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name <> 'players'")]
+    for t in tables:
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{t}")').fetchall():
+            if fk["table"] != "players":
+                continue
+            col = fk["from"]
+            moved[f"{t}.{col}"] = conn.execute(
+                f'UPDATE OR IGNORE "{t}" SET "{col}"=(SELECT canon FROM _merge WHERE old="{col}") '
+                f'WHERE "{col}" IN (SELECT old FROM _merge)').rowcount
+            conn.execute(f'DELETE FROM "{t}" WHERE "{col}" IN (SELECT old FROM _merge)')
+    # Keep what the duplicates knew that the canonical row lacks.
+    conn.execute(
+        "UPDATE players SET birth_date=COALESCE(birth_date, (SELECT MAX(p.birth_date) FROM "
+        "players p JOIN _merge m ON m.old=p.id WHERE m.canon=players.id)) "
+        "WHERE id IN (SELECT canon FROM _merge)")
+    # Each deleted player makes SQLite's FK check scan every child table for references,
+    # and feature_values (~14M rows) has no player_id index: 1,368 deletes took 18 hours
+    # on 2026-10-19. A throwaway index makes each check a lookup.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_fv_merge_tmp ON feature_values(player_id)")
+    moved["players"] = conn.execute(
+        "DELETE FROM players WHERE id IN (SELECT old FROM _merge)").rowcount
+    conn.execute("DROP INDEX ix_fv_merge_tmp")
+    return moved

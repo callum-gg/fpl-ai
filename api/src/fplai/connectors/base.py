@@ -322,7 +322,9 @@ def load_payload(row) -> Any:
             return json.loads(row["payload_inline"])
         except json.JSONDecodeError:
             return row["payload_inline"]
-    path = get_settings().data_dir / row["payload_path"]
+    # Docs archived by a host-side (Windows) run store `raw\ab\...`; PurePosixPath would
+    # read that as one filename inside the container. Same trap as _resolve_artefact.
+    path = get_settings().data_dir / row["payload_path"].replace("\\", "/")
     data = path.read_bytes()
     if path.suffix == ".zst":
         import zstandard as zstd

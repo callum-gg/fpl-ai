@@ -48,7 +48,10 @@ PRAGMAS = (
 
 # Additive schema changes made after a release. Each is (id, sql); failures on
 # "duplicate column" are swallowed so re-running is safe.
-_MIGRATIONS: list[tuple[str, str]] = []
+_MIGRATIONS: list[tuple[str, str]] = [
+    ("pfs_penalties_taken",
+     "ALTER TABLE player_fixture_stats ADD COLUMN penalties_taken INTEGER"),
+]
 
 _write_lock = threading.Lock()
 _local = threading.local()

@@ -286,6 +286,15 @@ def pens_taken_share(ctx: FeatureCtx) -> float:
     return {1: 0.9, 2: 0.08, 3: 0.02}.get(rank, 0.0)
 
 
+@feature("pens_taken90", deps=["player_fixture_stats"], group="setpiece", missing="zero",
+         description="penalties taken per 90 over the last 20 appearances (understat shots)")
+def pens_taken90(ctx: FeatureCtx) -> float | None:
+    """Penalty duty from what the player actually did, not a sheet: walk-forward by
+    construction, and back to 2014. 20 games because duty is sticky and pens are rare."""
+    rows = _played(_last(ctx, 20))
+    return rate_per90(sum(r.get("penalties_taken") or 0 for r in rows), sum(_mins(rows)))
+
+
 @feature("corner_duty", deps=["set_piece_roles"], group="setpiece", missing="zero")
 def corner_duty(ctx: FeatureCtx) -> float:
     ranks = [ctx.set_pieces.get("corners_left"), ctx.set_pieces.get("corners_right")]
