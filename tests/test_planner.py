@@ -111,6 +111,18 @@ def test_wildcard_transfers_are_free_and_reset_the_bank():
     assert gw2.free_transfers_in == 1          # reset to one, forfeiting the bank
 
 
+def test_owned_players_missing_from_a_later_gameweek_still_extract():
+    """A GW with no prediction for some owned players (a stale or partial predict run)
+    scores them 0; it must not KeyError while building that GW's formation and bench."""
+    owned, current = _squad_pool("own", quality=3.0, id_start=0)
+    pool = {c.player_id: c for c in owned}
+    later = {pid: c for pid, c in pool.items() if pid not in current[:6]}
+    plan = solve_plan({1: pool, 2: later}, PlanContext(
+        start_gw=1, horizon=2, current_squad=current, bank=0, free_transfers=1))
+    assert plan.status == "optimal"
+    assert all(len(g.bench_order) == 4 and g.formation for g in plan.gameweeks)
+
+
 def test_free_hit_at_a_full_bank_stays_feasible():
     """Regression: the FH lower arm used to demand ft[prev]+1 — 6 against the cap of 5
     at a full bank — making every full-bank Free Hit plan infeasible. The bank is
