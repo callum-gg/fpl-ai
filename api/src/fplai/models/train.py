@@ -163,6 +163,13 @@ def _head_to_head(name: str, score, valid_df, challenger) -> dict | None:
 
     keys = [_key(s, g) for s, g in
             zip(valid_df["season_id"], valid_df["gameweek"], strict=False)]
+    if keys and through >= min(keys):
+        # A refit incumbent (`_refit_metrics`) saw part of this holdout that the challenger
+        # was denied, so "unseen rows" pits a fit through GW n-1 against one trained to GW
+        # n-5 on GW n — the challenger loses on data, not skill, and the stack freezes.
+        log.info("%s: incumbent trained through %s, inside this holdout — no fair "
+                 "head-to-head, deferring to the fresher fit", name, through)
+        return None
     unseen = valid_df[np.array([k > through for k in keys], dtype=bool)]
     if len(unseen) < 30:
         log.info("%s: only %d holdout rows postdate the incumbent's training data — no "
@@ -214,7 +221,7 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
             "baseline_nll": _baseline_scoreline_nll(cutoff),
             "holdout_from": cutoff,
             "holdout": _holdout_span(valid_df),
-            "trained_through": _last_key(train_df),
+            "trained_through": _last_key(df),  # `tm` is fitted on every match
             "n_teams": len(tm.attack),
             "home_adv": tm.home_adv,
             "rho": tm.rho,
@@ -224,7 +231,7 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
                       len(df), seasons, FEATURE_VERSION)
 
     if "minutes" in wanted:
-        results["minutes"] = _train_minutes(train_df, valid_df, seasons, settings.current_season)
+        results["minutes"] = _train_minutes(train_df, valid_df, seasons, settings.current_season, df)
 
     for name, cols, target_fn, objective in (
         ("goals90", rates_mod.GOALS_FEATURES, _rate_target("goals_scored"), "tweedie"),
@@ -235,11 +242,11 @@ def train_all(seasons: list[str] | None = None, models: list[str] | None = None)
         if name in wanted:
             results[name] = _train_rate(
                 name, cols, target_fn, objective, train_df, valid_df, seasons,
-                settings.current_season,
+                settings.current_season, df,
             )
 
     if "defcon" in wanted:
-        results["defcon"] = _train_defcon(train_df, valid_df, seasons, settings.current_season)
+        results["defcon"] = _train_defcon(train_df, valid_df, seasons, settings.current_season, df)
 
     if "bonus" in wanted:
         results["bonus"] = _train_bonus(df, train_df, valid_df, seasons, settings.current_season)
@@ -256,15 +263,33 @@ def _rate_target(col: str):
     return fn
 
 
-def _train_minutes(train_df, valid_df, seasons, current_season) -> dict:
+def _refit_metrics(metrics: dict, train_df, df) -> dict:
+    """Ship the refit, keep the walk-forward score.
+
+    The holdout is the last 5 played GWs — in-season that is all of the current season —
+    so an artefact fitted on train_df alone never sees a single current-season result.
+    Like team_goals: score the train-only fit, ship the one fitted on everything.
+    `trained_through` must name what the *shipped* artefact saw, or next week's
+    head-to-head scores it in-sample.
+    """
+    metrics["scored_fit_through"] = _last_key(train_df)
+    metrics["trained_through"] = _last_key(df)
+    return metrics
+
+
+def _train_minutes(train_df, valid_df, seasons, current_season, df) -> dict:
+    def fit(frame):
+        played = frame[frame["minutes"].notna()]
+        y = np.array([minutes_mod.label_row(m, s) for m, s in
+                      zip(played["minutes"], played["starts"], strict=False)])
+        X = to_matrix(played.to_dict("records"), minutes_mod.FEATURES)
+        return minutes_mod.train(X, y, minutes_mod.FEATURES,
+                                 weights=_weights(played, current_season))
+
     played = train_df[train_df["minutes"].notna()]
     if len(played) < MIN_ROWS:
         return {"skipped": f"only {len(played)} rows"}
-    y = np.array([minutes_mod.label_row(m, s) for m, s in
-                  zip(played["minutes"], played["starts"], strict=False)])
-    rows = played.to_dict("records")
-    X = to_matrix(rows, minutes_mod.FEATURES)
-    artifact = minutes_mod.train(X, y, minutes_mod.FEATURES, weights=_weights(played, current_season))
+    artifact = fit(train_df)
 
     metrics: dict = {"train_rows": len(played), "holdout": _holdout_span(valid_df),
                      "trained_through": _last_key(train_df)}
@@ -281,22 +306,28 @@ def _train_minutes(train_df, valid_df, seasons, current_season) -> dict:
 
         metrics.update(score(artifact))
         metrics["head_to_head"] = _head_to_head("minutes", score, valid_df, artifact)
-    metrics["importance"] = _top_importance(artifact)
-    save_artifact("minutes", artifact, metrics, {"features": minutes_mod.FEATURES},
-                  len(played), seasons, FEATURE_VERSION)
+    final = fit(df)
+    metrics["importance"] = _top_importance(final)
+    save_artifact("minutes", final, _refit_metrics(metrics, train_df, df),
+                  {"features": minutes_mod.FEATURES}, len(played), seasons, FEATURE_VERSION)
     return metrics
 
 
-def _train_rate(name, cols, target_fn, objective, train_df, valid_df, seasons, current_season):
-    played = train_df[(train_df["minutes"].fillna(0) > 0)]
-    if name == "saves90":
-        played = played[played["position"] == "GK"]
+def _train_rate(name, cols, target_fn, objective, train_df, valid_df, seasons, current_season, df):
+    def rows_of(frame):
+        played = frame[(frame["minutes"].fillna(0) > 0)]
+        return played[played["position"] == "GK"] if name == "saves90" else played
+
+    def fit(frame):
+        played = rows_of(frame)
+        return fit_lgbm_regressor(to_matrix(played.to_dict("records"), cols),
+                                  target_fn(played).to_numpy(), cols, objective=objective,
+                                  weights=_weights(played, current_season))
+
+    played = rows_of(train_df)
     if len(played) < MIN_ROWS:
         return {"skipped": f"only {len(played)} rows"}
-    y = target_fn(played).to_numpy()
-    X = to_matrix(played.to_dict("records"), cols)
-    artifact = fit_lgbm_regressor(X, y, cols, objective=objective,
-                                  weights=_weights(played, current_season))
+    artifact = fit(train_df)
 
     metrics: dict = {"train_rows": len(played), "holdout": _holdout_span(valid_df),
                      "trained_through": _last_key(train_df)}
@@ -313,26 +344,33 @@ def _train_rate(name, cols, target_fn, objective, train_df, valid_df, seasons, c
 
         metrics.update(score(artifact))
         metrics["head_to_head"] = _head_to_head(name, score, vd, artifact)
-    metrics["importance"] = _top_importance(artifact)
-    save_artifact(name, artifact, metrics, {"features": cols, "objective": objective},
-                  len(played), seasons, FEATURE_VERSION)
+    final = fit(df)
+    metrics["importance"] = _top_importance(final)
+    save_artifact(name, final, _refit_metrics(metrics, train_df, df),
+                  {"features": cols, "objective": objective}, len(played), seasons,
+                  FEATURE_VERSION)
     return metrics
 
 
-def _train_defcon(train_df, valid_df, seasons, current_season) -> dict:
+def _train_defcon(train_df, valid_df, seasons, current_season, df) -> dict:
+    def fit(frame):
+        played = frame[(frame["minutes"].fillna(0) >= 30) & frame["defensive_contribution"].notna()]
+        y = (90.0 * played["defensive_contribution"]
+             / played["minutes"].clip(lower=1)).clip(upper=40)
+        X = to_matrix(played.to_dict("records"), rates_mod.DEFCON_FEATURES)
+        rate_model = fit_lgbm_regressor(X, y.to_numpy(), rates_mod.DEFCON_FEATURES,
+                                        objective="poisson",
+                                        weights=_weights(played, current_season))
+        expected = rate_model.predict(X) * played["minutes"].to_numpy() / 90.0
+        k = rates_mod.fit_dispersion(played["defensive_contribution"].to_numpy(), expected)
+        return rates_mod.DefconModel(rate_model=rate_model, dispersion=k)
+
     played = train_df[(train_df["minutes"].fillna(0) >= 30)
                       & train_df["defensive_contribution"].notna()]
     if len(played) < MIN_ROWS:
         return {"skipped": f"only {len(played)} DefCon rows"}
-    y = (90.0 * played["defensive_contribution"] / played["minutes"].clip(lower=1)).clip(upper=40)
-    X = to_matrix(played.to_dict("records"), rates_mod.DEFCON_FEATURES)
-    rate_model = fit_lgbm_regressor(X, y.to_numpy(), rates_mod.DEFCON_FEATURES,
-                                    objective="poisson",
-                                    weights=_weights(played, current_season))
-
-    expected = rate_model.predict(X) * played["minutes"].to_numpy() / 90.0
-    k = rates_mod.fit_dispersion(played["defensive_contribution"].to_numpy(), expected)
-    model = rates_mod.DefconModel(rate_model=rate_model, dispersion=k)
+    model = fit(train_df)
+    k = model.dispersion
 
     metrics: dict = {"train_rows": len(played), "dispersion": k,
                      "holdout": _holdout_span(valid_df),
@@ -355,20 +393,26 @@ def _train_defcon(train_df, valid_df, seasons, current_season) -> dict:
         metrics.update(score(model))
         metrics["threshold_base_rate"] = float(_hit(vd.to_dict("records")).mean())
         metrics["head_to_head"] = _head_to_head("defcon", score, vd, model)
-    save_artifact("defcon", model, metrics, {"features": rates_mod.DEFCON_FEATURES},
-                  len(played), seasons, FEATURE_VERSION)
+    final = fit(df)
+    metrics["dispersion"] = final.dispersion
+    save_artifact("defcon", final, _refit_metrics(metrics, train_df, df),
+                  {"features": rates_mod.DEFCON_FEATURES}, len(played), seasons, FEATURE_VERSION)
     return metrics
 
 
 def _train_bonus(df, train_df, valid_df, seasons, current_season) -> dict:
     """Historic + current-season models, blended by sample size (docs/06 model 4)."""
+    def fit_historic(frame):
+        played = frame[(frame["minutes"].fillna(0) > 0) & frame["bps"].notna()]
+        y = (90.0 * played["bps"] / played["minutes"].clip(lower=1)).clip(-10, 120)
+        X = to_matrix(played.to_dict("records"), bonus_mod.BPS_FEATURES)
+        return bonus_mod.train_bps(X, y.to_numpy(), bonus_mod.BPS_FEATURES,
+                                   weights=_weights(played, current_season))
+
     played = train_df[(train_df["minutes"].fillna(0) > 0) & train_df["bps"].notna()]
     if len(played) < MIN_ROWS:
         return {"skipped": f"only {len(played)} BPS rows"}
-    y = (90.0 * played["bps"] / played["minutes"].clip(lower=1)).clip(-10, 120)
-    X = to_matrix(played.to_dict("records"), bonus_mod.BPS_FEATURES)
-    historic = bonus_mod.train_bps(X, y.to_numpy(), bonus_mod.BPS_FEATURES,
-                                  weights=_weights(played, current_season))
+    historic = fit_historic(train_df)
 
     # The 2026/27 retune means older coefficients are biased, so fit the new regime alone.
     # Read current-season rows from the full frame, not train_df: early in a season the
@@ -403,8 +447,10 @@ def _train_bonus(df, train_df, valid_df, seasons, current_season) -> dict:
 
         metrics.update(score(model))
         metrics["head_to_head"] = _head_to_head("bonus", score, vd, model)
-    save_artifact("bonus", model, metrics, {"features": bonus_mod.BPS_FEATURES},
-                  len(played), seasons, FEATURE_VERSION)
+    final = bonus_mod.BonusModel(historic=fit_historic(df), current=current,
+                                 n_current_fixtures=n_current)
+    save_artifact("bonus", final, _refit_metrics(metrics, train_df, df),
+                  {"features": bonus_mod.BPS_FEATURES}, len(played), seasons, FEATURE_VERSION)
     return metrics
 
 
