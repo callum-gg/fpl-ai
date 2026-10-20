@@ -54,7 +54,11 @@ async def run_named(name: str) -> dict:
         )
         run_id = cur.lastrowid
     try:
-        result = JOBS[name]()
+        fn = JOBS[name]
+        # Sync jobs go to a thread. On the loop, build_features (~10 min, every :00/:30)
+        # blocked it past misfire_grace_time, so every :00 job — fpl_bootstrap, odds_poll,
+        # predict — was silently dropped for the whole of GW6-7.
+        result = fn() if asyncio.iscoroutinefunction(fn) else await asyncio.to_thread(fn)
         if asyncio.iscoroutine(result):
             result = await result
         status, detail = "ok", str(result)[:2000]
