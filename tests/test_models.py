@@ -454,6 +454,20 @@ def test_season_weighting_decays_with_age():
     assert season_weight("2016-17", "2026-27") < 0.05
 
 
+def test_an_artefact_trained_on_the_other_os_still_resolves(monkeypatch):
+    """A host-trained Windows path must find the file in models_dir on Linux, and vice
+    versa. Getting this wrong fails silently: every model degrades to its heuristic."""
+    from fplai.config import get_settings
+    from fplai.models.base import _resolve_artefact
+
+    models_dir = get_settings().models_dir
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "minutes-1.pkl").write_bytes(b"x")
+    for stored in (r"T:\FPL\data\models\minutes-1.pkl", "/app/data/models/minutes-1.pkl"):
+        assert _resolve_artefact(stored) == models_dir / "minutes-1.pkl"
+    assert _resolve_artefact(r"T:\FPL\data\models\gone-1.pkl") is None
+
+
 def test_calibration_metrics_behave():
     from fplai.models.base import ece, log_loss, spearman
 
@@ -938,11 +952,18 @@ def test_the_head_to_head_only_uses_rows_the_incumbent_never_trained_on(monkeypa
         seen["gameweeks"] = sorted(set(d["gameweek"]))
         return {"mae": 1.0}
 
+    # Trained into the holdout (a refit): scoring it on GW3 alone pits a fit through GW2
+    # against a challenger trained through GW0 — no fair comparison, the caller falls back.
+    assert train._head_to_head("goals90", score, valid, "the-challenger") is None
+
+    # Trained before the holdout: both scored on the whole window.
+    monkeypatch.setattr(
+        train, "query_one",
+        lambda sql, params=(): {"metrics_json": _json.dumps({"trained_through": "2025-26:38"})},
+    )
     result = train._head_to_head("goals90", score, valid, "the-challenger")
     assert result["challenger"] == {"mae": 1.0} and result["incumbent"] == {"mae": 1.0}
-    assert result["rows"] == 40
-    assert seen["gameweeks"] == [3]        # GW1-2 were in the incumbent's training data
-    assert seen["rows"] == 40
+    assert result["rows"] == 120 and seen["gameweeks"] == [1, 2, 3]
 
     # Nothing postdates it -> no honest comparison, so the caller falls back.
     monkeypatch.setattr(

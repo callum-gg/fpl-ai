@@ -265,13 +265,21 @@ def run(
 
 
 def latest(season_id: str, gameweek: int) -> list[dict]:
+    """Every fixture row of each player's newest prediction run for the gameweek.
+
+    Newest per *player*, not per (player, fixture): a double gameweek's legs share one
+    `generated_at`, while a fixture the player no longer has — he changed club, or it was
+    rescheduled — only exists in older runs. Keying on the fixture kept those rows alive
+    and `horizon_points` summed them as a DGW: Ndiaye's pre-move EVE v IPS row was added
+    to his MCI v SUN one and the GW5 plan captained a 3.1-point player at 6.5.
+    """
     return [
         dict(r)
         for r in query(
             "SELECT p.* FROM predictions p JOIN ("
-            "  SELECT player_id, fixture_key, MAX(generated_at) g FROM predictions "
-            "  WHERE season_id=? AND gameweek=? GROUP BY player_id, fixture_key"
-            ") x ON x.player_id=p.player_id AND x.fixture_key=p.fixture_key AND x.g=p.generated_at "
+            "  SELECT player_id, MAX(generated_at) g FROM predictions "
+            "  WHERE season_id=? AND gameweek=? GROUP BY player_id"
+            ") x ON x.player_id=p.player_id AND x.g=p.generated_at "
             "WHERE p.season_id=? AND p.gameweek=?",
             (season_id, gameweek, season_id, gameweek),
         )

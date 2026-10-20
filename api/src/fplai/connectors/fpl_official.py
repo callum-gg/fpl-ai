@@ -342,8 +342,8 @@ class FplOfficialConnector(Connector):
                     "INSERT INTO player_fixture_stats(player_id,fixture_id,team_id,was_home,"
                     "minutes,goals_scored,assists,clean_sheets,goals_conceded,own_goals,"
                     "penalties_saved,penalties_missed,yellow_cards,red_cards,saves,bonus,bps,"
-                    "defensive_contribution,total_points,starts,source_ids_json,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'[\"fpl_official\"]',?) "
+                    "defensive_contribution,total_points,starts,xg,xa,source_ids_json,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'[\"fpl_official\"]',?) "
                     "ON CONFLICT(player_id,fixture_id) DO UPDATE SET minutes=excluded.minutes,"
                     "goals_scored=excluded.goals_scored,assists=excluded.assists,"
                     "clean_sheets=excluded.clean_sheets,goals_conceded=excluded.goals_conceded,"
@@ -352,6 +352,7 @@ class FplOfficialConnector(Connector):
                     "red_cards=excluded.red_cards,saves=excluded.saves,bonus=excluded.bonus,"
                     "bps=excluded.bps,defensive_contribution=excluded.defensive_contribution,"
                     "total_points=excluded.total_points,starts=excluded.starts,"
+                    "xg=COALESCE(excluded.xg,xg),xa=COALESCE(excluded.xa,xa),"
                     "updated_at=excluded.updated_at",
                     (
                         pid, fx["id"], fx["team_id"], int(fx["home_team_id"] == fx["team_id"]),
@@ -362,7 +363,8 @@ class FplOfficialConnector(Connector):
                         stats.get("red_cards"), stats.get("saves"), stats.get("bonus"),
                         stats.get("bps"),
                         stats.get("defensive_contribution"), stats.get("total_points"),
-                        stats.get("starts"), utcnow(),
+                        stats.get("starts"), _f(stats.get("expected_goals")),
+                        _f(stats.get("expected_assists")), utcnow(),
                     ),
                 )
                 n += 1
@@ -440,7 +442,8 @@ def _upsert_history_rows(conn, element_id: int, history: list[dict]) -> int:
             "yellow_cards=excluded.yellow_cards,red_cards=excluded.red_cards,saves=excluded.saves,"
             "bonus=excluded.bonus,bps=excluded.bps,"
             "defensive_contribution=excluded.defensive_contribution,"
-            "total_points=excluded.total_points,starts=excluded.starts,updated_at=excluded.updated_at",
+            "total_points=excluded.total_points,starts=excluded.starts,"
+            "xg=COALESCE(excluded.xg,xg),xa=COALESCE(excluded.xa,xa),updated_at=excluded.updated_at",
             (
                 pid, fx["id"], ps["team_id"] if ps else None, int(bool(h.get("was_home"))),
                 h.get("minutes"), h.get("goals_scored"), h.get("assists"), h.get("clean_sheets"),

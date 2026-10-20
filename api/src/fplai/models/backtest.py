@@ -456,15 +456,28 @@ def score_gameweek(season_id: str, gameweek: int, persist: bool = True) -> dict:
         return {"season_id": season_id, "gameweek": gameweek, "n": 0,
                 "note": "no results stored for this gameweek yet"}
 
+    # Price and ownership as they stood at the deadline, never the newest row. The newest
+    # ownership already contains everyone who bought the week's haulers *after* the haul,
+    # which grades the baseline on the answer: GW3's bar read 0.53 on today's ownership.
+    deadline = query("SELECT deadline_utc FROM gameweeks WHERE season_id=? AND gameweek=?",
+                     (season_id, gameweek))[0]["deadline_utc"]
     prices = {
         r["player_id"]: dict(r)
         for r in query(
-            "SELECT player_id, price, selected_by_percent FROM player_prices p WHERE season_id=? "
+            "SELECT player_id, price FROM player_prices p WHERE season_id=? "
             "AND observed_at = (SELECT MAX(observed_at) FROM player_prices "
-            "  WHERE player_id=p.player_id AND season_id=p.season_id)",
-            (season_id,),
+            "  WHERE player_id=p.player_id AND season_id=p.season_id AND observed_at < ?)",
+            (season_id, deadline),
         )
     }
+    for r in query(
+        "SELECT player_id, owned_pct FROM ownership_snapshots o WHERE season_id=? "
+        "AND scope='overall' AND observed_at = (SELECT MAX(observed_at) FROM "
+        "  ownership_snapshots WHERE player_id=o.player_id AND season_id=o.season_id "
+        "  AND scope='overall' AND observed_at < ?)",
+        (season_id, deadline),
+    ):
+        prices.setdefault(r["player_id"], {})["selected_by_percent"] = r["owned_pct"]
 
     rows = []
     for p in preds:

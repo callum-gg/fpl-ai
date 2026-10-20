@@ -111,6 +111,18 @@ def test_wildcard_transfers_are_free_and_reset_the_bank():
     assert gw2.free_transfers_in == 1          # reset to one, forfeiting the bank
 
 
+def test_owned_players_missing_from_a_later_gameweek_still_extract():
+    """A GW with no prediction for some owned players (a stale or partial predict run)
+    scores them 0; it must not KeyError while building that GW's formation and bench."""
+    owned, current = _squad_pool("own", quality=3.0, id_start=0)
+    pool = {c.player_id: c for c in owned}
+    later = {pid: c for pid, c in pool.items() if pid not in current[:6]}
+    plan = solve_plan({1: pool, 2: later}, PlanContext(
+        start_gw=1, horizon=2, current_squad=current, bank=0, free_transfers=1))
+    assert plan.status == "optimal"
+    assert all(len(g.bench_order) == 4 and g.formation for g in plan.gameweeks)
+
+
 def test_free_hit_at_a_full_bank_stays_feasible():
     """Regression: the FH lower arm used to demand ft[prev]+1 — 6 against the cap of 5
     at a full bank — making every full-bank Free Hit plan infeasible. The bank is
@@ -273,3 +285,43 @@ def test_the_plan_says_when_it_is_flying_without_the_market(seeded_season, playe
     stale = warnings()
     assert "No match odds" not in stale
     assert "old" in stale and "odds" in stale.lower()
+
+
+def test_the_plan_says_when_a_trained_model_will_not_load(seeded_season):
+    """GW3-5 of 2026-27 were planned on heuristics because every active artefact was
+    unreadable in the container, and nothing but a log line said so."""
+    from fplai.db.engine import writer
+    from fplai.models.base import clear_cache
+    from fplai.optimiser.recommend import _data_warnings
+
+    with writer() as conn:
+        conn.execute(
+            "INSERT INTO model_versions(model_name,version,trained_at,train_rows,"
+            "train_seasons,metrics_json,params_json,artefact_path,feature_version,is_active) "
+            "VALUES('minutes','gone','2026-09-01T00:00:00+00:00',1,'[]','{}','{}',"
+            "'/nowhere/minutes-gone.pkl',1,1)"
+        )
+    clear_cache()
+    assert "minutes could not be loaded" in " ".join(_data_warnings(seeded_season, 1, []))
+
+
+def test_a_fixture_from_an_older_run_is_not_summed_as_a_double(seeded_season, player_pool):
+    """A player who changed club keeps his old-club row in older runs. Only the newest run
+    counts, while a genuine double gameweek (both legs in that run) still sums."""
+    from fplai.db.engine import writer
+    from fplai.models.predict import horizon_points
+
+    mover, dgw = player_pool[0], player_pool[1]
+    rows = [(mover, 44, "2026-08-27T00:00:00+00:00", 3.4),   # pre-move fixture, old run
+            (mover, 46, "2026-09-18T00:00:00+00:00", 3.1),   # new club, newest run
+            (dgw, 46, "2026-09-18T00:00:00+00:00", 3.0),
+            (dgw, 47, "2026-09-18T00:00:00+00:00", 2.5)]
+    with writer() as conn:
+        conn.executemany(
+            "INSERT INTO predictions(player_id,season_id,gameweek,fixture_key,generated_at,"
+            "exp_points) VALUES(?,?,7,?,?,?)",
+            [(p, seeded_season, fk, g, xp) for p, fk, g, xp in rows],
+        )
+    hp = horizon_points(seeded_season, 7, 1)
+    assert hp[mover] == [3.1]
+    assert hp[dgw] == [5.5]

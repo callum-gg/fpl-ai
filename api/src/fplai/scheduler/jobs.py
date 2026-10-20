@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -53,7 +54,11 @@ async def run_named(name: str) -> dict:
         )
         run_id = cur.lastrowid
     try:
-        result = JOBS[name]()
+        fn = JOBS[name]
+        # Sync jobs go to a thread. On the loop, build_features (~10 min, every :00/:30)
+        # blocked it past misfire_grace_time, so every :00 job — fpl_bootstrap, odds_poll,
+        # predict — was silently dropped for the whole of GW6-7.
+        result = fn() if asyncio.iscoroutinefunction(fn) else await asyncio.to_thread(fn)
         if asyncio.iscoroutine(result):
             result = await result
         status, detail = "ok", str(result)[:2000]
@@ -260,7 +265,15 @@ async def extract_claims() -> dict:
     from ..llm.embed import embed_pending
     from ..llm.extract import drain
 
-    embedded = embed_pending(200)
+    # Search indexing must not gate extraction. A damaged vec0 table (the 2026-09-12
+    # recovery left one chunk's vector blob empty) raised here on every run, so no claim
+    # was extracted for a week and the injury/news layer went quiet without a single
+    # prediction saying so. The embed error is still reported in the result.
+    try:
+        embedded = embed_pending(200)
+    except sqlite3.Error as e:
+        log.warning("embedding failed, extracting anyway: %s", e)
+        embedded = f"failed: {e}"
     result = await drain(50, _season())
     return {**result, "embedded": embedded}
 
@@ -322,13 +335,23 @@ def optimise_all_squads() -> dict:
 
     season = _season()
     gw = next_gameweek(season)
-    out = []
+    out, failed = [], []
     for r in query("SELECT id FROM squads WHERE archived=0"):
         try:
             out.append({"squad_id": r["id"], "variants": len(recommend(r["id"], season, gw))})
         except Exception as e:  # noqa: BLE001
             log.warning("optimise failed for squad %s: %s", r["id"], e)
-    return {"squads": out}
+            failed.append({"squad_id": r["id"], "error": str(e)})
+    # A job that recommends nothing at all is not a healthy job. Swallowing every squad's
+    # exception and returning ok/{'squads': []} is how a dead pipeline kept reporting
+    # success from 2026-09-04 to 2026-09-12: predictions were unreadable the whole time
+    # and nothing in the run record said so. Raise once every squad has failed.
+    if failed and not out:
+        raise RuntimeError(
+            f"optimise produced no recommendation for any of {len(failed)} squad(s): "
+            + "; ".join(f"squad {f['squad_id']}: {f['error']}" for f in failed)
+        )
+    return {"squads": out, "failed": failed}
 
 
 @job("train_models")
@@ -381,9 +404,23 @@ def vacuum_analyze() -> dict:
     from ..db.engine import get_conn
 
     conn = get_conn()
+    # Integrity first, and VACUUM only if it passes. Two reasons, both learned the hard
+    # way: VACUUM rewrites every page of the file, so running it on an already-corrupt DB
+    # turns a partly-recoverable file into a uniformly broken one; and nothing else in the
+    # app ever asks SQLite whether the file is sound. The 2026-09-04 corruption went
+    # unnoticed until 2026-09-12 because every job that touched a bad page logged its own
+    # failure and no job ever reported the cause. quick_check is the cheap version of
+    # integrity_check (no index cross-checks) -- seconds on this file, once a day.
+    bad = [r[0] for r in conn.execute("PRAGMA quick_check(20)") if r[0] != "ok"]
+    if bad:
+        raise RuntimeError(
+            "sqlite quick_check failed -- VACUUM skipped so the file stays recoverable. "
+            "Recover with `sqlite3 fplai.db .recover | sqlite3 fplai.new.db`. First "
+            f"errors: {bad[:5]}"
+        )
     conn.execute("ANALYZE")
     conn.execute("VACUUM")
-    return {"ok": True}
+    return {"ok": True, "quick_check": "ok"}
 
 
 # --- scheduling -----------------------------------------------------------------
@@ -433,7 +470,9 @@ DEFAULT_CADENCE = {
     "resolve_pundit_calls": "0 11 * * 2",
     "discord_digest": "0 8 * * *",
     "deadline_alerts": "0 * * * *",
-    "vacuum_analyze": "0 4 1 * *",
+    # Daily, not monthly: this is now the integrity check as much as the compaction, and a
+    # month is long enough for a corrupt DB to eat a whole run of gameweeks unnoticed.
+    "vacuum_analyze": "0 4 * * *",
 }
 
 _scheduler = None

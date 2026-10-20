@@ -26,7 +26,7 @@ LEAGUE_AVG_TEAM_XG = 1.42
 GOALS_FEATURES = [
     "xg90_last3", "xg90_last5", "xg90_last10", "npxg90_last5", "npxg90_last10",
     "shots90", "sot90", "touches_box90", "big_chances90", "conversion_ratio",
-    "xg_overperformance_last10", "is_first_pen_taker", "pens_taken_share",
+    "xg_overperformance_last10", "is_first_pen_taker", "pens_taken_share", "pens_taken90",
     "team_expected_goals", "opponent_defence_rating", "is_home",
     "p_anytime_scorer_odds", "opp_goals_conceded_ewma", "age",
     "transfermarkt_value_pct_of_squad", "promoted_club_flag", "block_odds_present",

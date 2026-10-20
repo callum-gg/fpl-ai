@@ -40,6 +40,11 @@ class LLMTask:
     cacheable: bool = True
     system: str = ""
     json_only: bool = True
+    # Reasoning models (nemotron-3 here) spend max_tokens on `reasoning_content` first, and
+    # on the chunks that actually carry news they spend all of it: 1,206 of 2,227
+    # extraction calls this season ended at the cap with no JSON. False asks the chat
+    # template to skip thinking; endpoints that don't know the switch ignore it.
+    thinking: bool = True
 
     def model(self) -> str:
         cfg = global_settings().get("llm.tasks", {}).get(self.name, {})
@@ -124,7 +129,9 @@ async def complete(
     phash = prompt_hash(task.name, model, messages)
     if task.cacheable and not tools:
         hit = _cached(task.name, model, phash)
-        if hit is not None:
+        # A cached call that never produced its JSON is a failure, not an answer. Replaying
+        # it would pin every budget-exhausted chunk to "no claims" forever.
+        if hit is not None and (hit.data is not None or task.response_schema is None):
             return hit
 
     body: dict = {
@@ -133,6 +140,8 @@ async def complete(
         "temperature": task.temp(),
         "max_tokens": task.max_tokens,
     }
+    if not task.thinking:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"

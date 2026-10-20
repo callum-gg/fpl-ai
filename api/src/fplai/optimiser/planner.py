@@ -373,14 +373,20 @@ def _extract(prob, x, s, c, tin, tout, hits, ft, chips, gws, ids, meta, utility,
                 hits=int(hits[g].value() or 0),
                 chip=chip,
                 xi=xi,
-                bench_order=order_bench(bench, cands) if cands else bench,
+                bench_order=sorted(
+                    order_bench([p for p in bench if p in cands], cands)
+                    + [p for p in bench if p not in cands],
+                    key=lambda p: meta[p]["position"] != "GK"),
                 captain=captain,
                 vice=vice,
                 squad=squad,
                 exp_points=sum(cd.exp_points for cd in xi_cands)
                 + (cands[captain].exp_points if captain in cands else 0.0),
                 sd_points=_squad_sd(xi_cands),
-                formation=_formation(xi, cands) if cands else "",
+                # meta, not cands: a squad player with no prediction for g (utility 0 in _u)
+                # can still sit in the XI, and cands[p] would KeyError on him.
+                formation="-".join(str(sum(meta[p]["position"] == pos for p in xi))
+                                   for pos in ("DEF", "MID", "FWD")),
                 free_transfers_in=int(ft[g].value() or 0),
                 bank_after=bank,
             )

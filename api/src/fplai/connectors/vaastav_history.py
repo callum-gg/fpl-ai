@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from ..db.engine import query_one
 from ..resolve.entities import by_external_id, link_external_id, upsert_player
 from ..resolve.normalise import norm_name
-from .base import Connector, IngestContext, ParsedBatch, RawDoc, fetch_url, utcnow
+from .base import Connector, IngestContext, ParsedBatch, RawDoc, fetch_url, load_payload, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -72,17 +72,26 @@ class VaastavConnector(Connector):
             n = 0
             team_ids = _ensure_teams(conn, season, rows)
             fixture_ids = _build_fixtures(conn, season, rows, team_ids)
+            codes = season_codes(season)
             for r in rows:
                 name = (r.get("name") or "").replace("_", " ").strip()
                 if not name:
                     continue
                 element = r.get("element")
+                code = codes.get(str(element))
                 pid = by_external_id("fpl_element", f"{season}:{element}") if element else None
+                # FPL's `code` is the one id that survives seasons. Matching on the bare name
+                # instead split ~870 players into 2-4 rows each ("Petr Cech 1", mis-encoded
+                # accents, renames) and fused two different Wilsons into one.
+                if pid is None and code:
+                    pid = by_external_id("fpl", code)
                 if pid is None:
-                    pid = _find_or_create(conn, name)
-                    if element:
-                        link_external_id(conn, pid, "fpl_element", f"{season}:{element}",
-                                         "deterministic", 0.9)
+                    pid = (_create(conn, name) if code else _find_or_create(conn, name))
+                if element:
+                    link_external_id(conn, pid, "fpl_element", f"{season}:{element}",
+                                     "deterministic", 0.9)
+                if code and by_external_id("fpl", code) is None:
+                    link_external_id(conn, pid, "fpl", code, "exact")
                 team_id = _row_team(r, team_ids)
                 fixture_id = fixture_ids.get(_i(r.get("fixture")))
                 if fixture_id is None:
@@ -146,8 +155,26 @@ def _find_or_create(conn, full_name: str) -> int:
     )
     if row:
         return row["player_id"]
+    return _create(conn, full_name)
+
+
+def _create(conn, full_name: str) -> int:
     parts = full_name.split(" ")
     return upsert_player(conn, full_name, parts[0], " ".join(parts[1:]) or parts[0], parts[-1])
+
+
+def season_codes(season: str) -> dict[str, str]:
+    """element id -> FPL `code` for one season, from the archived players_raw.csv."""
+    row = query_one(
+        "SELECT * FROM raw_documents WHERE source_id='vaastav_history' "
+        "AND doc_type='vaastav_players' AND external_id=? ORDER BY id DESC LIMIT 1", (season,))
+    if row is None:
+        return {}
+    text = load_payload(row)
+    if not isinstance(text, str):
+        return {}
+    return {r["id"]: r["code"] for r in csv.DictReader(io.StringIO(text))
+            if r.get("id") and r.get("code")}
 
 
 def _ensure_teams(conn, season: str, rows: list[dict]) -> dict[str, int]:
@@ -265,3 +292,47 @@ def _build_fixtures(conn, season: str, rows: list[dict], team_ids: dict[str, int
         if row:
             out[fx] = row["id"]
     return out
+
+
+def duplicate_players_by_code() -> dict[int, int]:
+    """{duplicate player id: canonical id} for every footballer split across rows.
+
+    Grouped by FPL `code` via each season's element links. A row reachable from two codes
+    is two people already fused by the old name matching; it is left out rather than
+    allowed to chain both groups into one.
+    """
+    import re
+
+    from ..db.engine import query
+
+    by_code: dict[str, set[int]] = {}
+    for s in [r["id"] for r in query("SELECT id FROM seasons")]:
+        for element, code in season_codes(s).items():
+            pid = by_external_id("fpl_element", f"{s}:{element}")
+            if pid is not None:
+                by_code.setdefault(code, set()).add(pid)
+    live = {r["external_id"]: r["player_id"]
+            for r in query("SELECT external_id, player_id FROM player_external_ids WHERE system='fpl'")}
+    for code, pid in live.items():
+        by_code.setdefault(code, set()).add(pid)
+
+    seen: dict[int, int] = {}
+    for pids in by_code.values():
+        for p in pids:
+            seen[p] = seen.get(p, 0) + 1
+    last_season = {r["player_id"]: r["s"] for r in
+                   query("SELECT player_id, MAX(season_id) s FROM player_seasons GROUP BY player_id")}
+    names = {r["id"]: r["canonical_name"] for r in query("SELECT id, canonical_name FROM players")}
+
+    mapping: dict[int, int] = {}
+    for code, pids in by_code.items():
+        pids = {p for p in pids if seen[p] == 1}
+        if len(pids) < 2:
+            continue
+        if live.get(code) in pids:
+            canon = live[code]
+        else:
+            canon = min(pids, key=lambda p: (bool(re.search(r"\d|�", names.get(p, ""))),
+                                             -int((last_season.get(p) or "0")[:4]), p))
+        mapping.update({p: canon for p in pids if p != canon})
+    return mapping

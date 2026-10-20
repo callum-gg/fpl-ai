@@ -158,7 +158,10 @@ implies lower risk and protect_rank. Only include keys the request actually just
 
 TASKS: dict[str, LLMTask] = {
     "extract_claims": LLMTask(
-        name="extract_claims", temperature=0.1, max_tokens=1500,
+        # Thinking off, measured on 8 news-bearing chunks: 8/8 parsed and 22 claims, against
+        # 2/8 and 0 with it on (the budget went on reasoning). 3000 is pure-JSON headroom —
+        # one dense chunk needed 1,430 tokens for 16 claims.
+        name="extract_claims", temperature=0.1, max_tokens=3000, thinking=False,
         system=EXTRACT_CLAIMS_SYSTEM, response_schema=dict, cacheable=True,
     ),
     "resolve_entity": LLMTask(

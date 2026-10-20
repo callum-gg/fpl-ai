@@ -675,6 +675,18 @@ def _data_warnings(season_id: str, gameweek: int, xi: list[int]) -> list[str]:
         out.append(f"Match odds are {odds_age:.0f}h old (last polled {odds_at}) — prices "
                    "move most in the 24h before a deadline.")
 
+    # A trained model that will not load degrades to its heuristic with a log line and
+    # nothing else. GW3-5 of 2026-27 were planned that way — every artefact path was
+    # host-written and unreadable in the container — and pool rho fell from ~0.45 to 0.18.
+    from ..models.base import load_active
+
+    dead = [r["model_name"] for r in query(
+        "SELECT DISTINCT model_name FROM model_versions WHERE is_active=1 ORDER BY model_name"
+    ) if load_active(r["model_name"]) is None]
+    if dead:
+        out.append(f"Trained model(s) {', '.join(dead)} could not be loaded — those "
+                   "predictions come from fallback heuristics, not the trained stack.")
+
     pred = query_one(
         "SELECT MAX(generated_at) t FROM predictions WHERE season_id=? AND gameweek=?",
         (season_id, gameweek),

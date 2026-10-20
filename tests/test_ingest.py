@@ -206,6 +206,16 @@ def test_ambiguous_shared_forename_resolves_to_none(players, seeded_season):
         assert res.method in ("ambiguous", "review", "miss")
 
 
+def test_a_players_own_aliases_do_not_count_as_a_rival(players, seeded_season):
+    """"Trent John Alexander-Arnold" scores 100 against two of Trent's own aliases. Measuring
+    the margin against the raw runner-up sent every such name to review — Bruno, Raya,
+    Caicedo and Dalot all failed to link to understat that way."""
+    from fplai.resolve.entities import resolve_name
+
+    res = resolve_name("Trent John Alexander-Arnold", None, seeded_season, allow_review=False)
+    assert res.player_id == players["Trent Alexander-Arnold"] and res.method == "fuzzy"
+
+
 def test_unknown_name_does_not_resolve(players, seeded_season):
     from fplai.resolve.entities import resolve_name
 
@@ -416,3 +426,132 @@ def test_fixture_level_odds_are_cached_but_not_stale(seeded_season):
     refresh()
     assert team_lambdas.cache_info().currsize == 0
     assert odds_movement.cache_info().currsize == 0
+
+
+def test_both_fpl_stat_writers_keep_xg(seeded_season):
+    """GW1, 2, 4 and 6 of 2026/27 had no xG for any player who played. The live reconcile
+    inserted rows without it, and the element-summary upsert's conflict branch then never
+    set it, so whichever writer got there first decided whether a GW had xG at all."""
+    from fplai.connectors import registry as connectors
+    from fplai.connectors.base import RawDoc, apply_batch
+    from fplai.connectors.fpl_official import _upsert_history_rows
+    from fplai.db.engine import query_one, writer
+    from fplai.resolve.entities import link_external_id, upsert_player
+
+    with writer() as conn:
+        pid = upsert_player(conn, "Xg Probe", "Xg", "Probe", "Probe")
+        link_external_id(conn, pid, "fpl_element", "2026-27:900", "test")
+        home, away = (r["id"] for r in conn.execute(
+            "SELECT id FROM teams WHERE season_id='2026-27' ORDER BY id LIMIT 2").fetchall())
+        conn.execute("INSERT INTO player_seasons(player_id,season_id,team_id,position) "
+                     "VALUES(?,'2026-27',?,'FWD')", (pid, home))
+        fx = conn.execute("INSERT INTO fixtures(season_id,fpl_fixture_id,gameweek,home_team_id,"
+                          "away_team_id) VALUES('2026-27',990901,37,?,?)", (home, away)).lastrowid
+
+    live = RawDoc("event_live", {"elements": [{"id": 900, "stats": {
+        "minutes": 90, "expected_goals": "0.45", "expected_assists": "0.10"}}]},
+        external_id="2026-27:37")
+    with writer() as conn:
+        apply_batch(conn, connectors.get("fpl_official").parse(live))
+    xg = lambda: query_one("SELECT xg FROM player_fixture_stats WHERE player_id=? AND "
+                           "fixture_id=?", (pid, fx))["xg"]
+    assert xg() == 0.45
+
+    with writer() as conn:        # the conflict branch now updates it...
+        _upsert_history_rows(conn, 900, [{"fixture": 990901, "minutes": 90,
+                                          "expected_goals": "0.50"}])
+    assert xg() == 0.50
+    with writer() as conn:        # ...but a missing value never wipes it
+        _upsert_history_rows(conn, 900, [{"fixture": 990901, "minutes": 90}])
+    assert xg() == 0.50
+
+
+def test_understat_writes_onto_the_players_own_fixture_that_day(seeded_season):
+    """Matching on the date alone took LIMIT 1 of whichever game kicked off first, so on a
+    full Saturday most rows went nowhere. Also: on-target, big-chance and penalty counts
+    come from the shot list, and FPL's xG is never overwritten."""
+    from fplai.connectors.understat import shot_stats, update_fixture_stats
+    from fplai.db.engine import query_one, writer
+    from fplai.resolve.entities import upsert_player
+
+    with writer() as conn:
+        pid = upsert_player(conn, "Us Probe", "Us", "Probe", "UsProbe")
+        a, b = (r["id"] for r in conn.execute(
+            "SELECT id FROM teams WHERE season_id='2026-27' ORDER BY id LIMIT 2").fetchall())
+        other = conn.execute("INSERT INTO fixtures(season_id,gameweek,kickoff_utc,home_team_id,"
+                             "away_team_id) VALUES('2026-27',36,'2027-05-08T11:30:00Z',?,?)",
+                             (b, a)).lastrowid
+        mine = conn.execute("INSERT INTO fixtures(season_id,gameweek,kickoff_utc,home_team_id,"
+                            "away_team_id) VALUES('2026-27',36,'2027-05-08T14:00:00Z',?,?)",
+                            (a, b)).lastrowid
+        conn.execute("INSERT INTO player_fixture_stats(player_id,fixture_id,team_id,was_home,minutes,xg) "
+                     "VALUES(?,?,?,1,90,0.9)", (pid, mine, a))
+
+    per_match = shot_stats([
+        {"match_id": "7", "result": "Goal", "situation": "Penalty", "xG": "0.76"},
+        {"match_id": "7", "result": "MissedShots", "situation": "OpenPlay", "xG": "0.05"},
+        {"match_id": "7", "result": "SavedShot", "situation": "OpenPlay", "xG": "0.35"},
+    ])
+    m = {"id": "7", "date": "2027-05-08", "xG": "1.16", "npxG": "0.40", "shots": "3",
+         "key_passes": "2", "xA": "0.1"}
+    with writer() as conn:
+        assert update_fixture_stats(conn, pid, "2026-27", m["date"], m, per_match["7"]) == 1
+    row = query_one("SELECT * FROM player_fixture_stats WHERE player_id=? AND fixture_id=?",
+                    (pid, mine))
+    assert (row["shots"], row["shots_on_target"], row["big_chances"], row["penalties_taken"],
+            row["key_passes"]) == (3, 2, 2, 1, 2)
+    assert row["npxg"] == 0.40 and row["xg"] == 0.9      # FPL's xG kept, understat fills npxG
+    assert query_one("SELECT COUNT(*) n FROM player_fixture_stats WHERE fixture_id=?",
+                     (other,))["n"] == 0
+
+
+def test_merge_players_folds_a_split_footballer_into_one_row(seeded_season):
+    """One footballer as two rows split by season lost his history at the split. The merge
+    repoints every reference; on a unique-key clash the canonical row's copy wins."""
+    from fplai.db.engine import query_one, writer
+    from fplai.resolve.entities import add_alias, merge_players, upsert_player
+
+    with writer() as conn:
+        old = upsert_player(conn, "Merge Probe 1", "Merge", "Probe", "Probe")
+        new = upsert_player(conn, "Merge Probe Junior", "Merge", "Probe", "Probe")
+        conn.execute("UPDATE players SET birth_date='2000-01-01' WHERE id=?", (old,))
+        team = conn.execute("SELECT id FROM teams WHERE season_id='2026-27' LIMIT 1").fetchone()[0]
+        fx = conn.execute("INSERT INTO fixtures(season_id,gameweek,kickoff_utc,home_team_id,"
+                          "away_team_id) VALUES('2026-27',35,'2027-05-01T14:00:00Z',?,?)",
+                          (team, team)).lastrowid
+        conn.execute("INSERT INTO player_fixture_stats(player_id,fixture_id,team_id,was_home,"
+                     "minutes) VALUES(?,?,?,1,90)", (old, fx, team))
+        add_alias(conn, old, "shared alias")
+        add_alias(conn, new, "shared alias")          # collides once repointed
+        moved = merge_players(conn, {old: new})
+
+    assert moved["players"] == 1
+    assert query_one("SELECT id FROM players WHERE id=?", (old,)) is None
+    assert query_one("SELECT player_id FROM player_fixture_stats WHERE fixture_id=?",
+                     (fx,))["player_id"] == new
+    assert query_one("SELECT birth_date FROM players WHERE id=?", (new,))["birth_date"] == "2000-01-01"
+    assert query_one("SELECT COUNT(*) n FROM player_aliases WHERE player_id=?", (old,))["n"] == 0
+
+
+def test_vaastav_links_seasons_by_fpl_code_not_by_name(seeded_season):
+    """The same keeper as "Petr Cech 1" one season and "Petr Cech" the next was two
+    players; the FPL `code` in players_raw is the id that survives seasons."""
+    from fplai.connectors import registry
+    from fplai.connectors.base import RawDoc, apply_batch, archive
+    from fplai.db.engine import writer
+    from fplai.resolve.entities import by_external_id
+
+    c = registry.get("vaastav_history")
+    head = "name,element,team,fixture,GW,kickoff_time,was_home,minutes,position\n"
+    for season, name, element in (("2014-15", "Petr Cech 1", 11), ("2015-16", "Petr Cech", 22)):
+        raw = f"id,code,first_name,second_name\n{element},11334,Petr,Cech\n50,99999,Other,Guy\n"
+        gws = (head + f"{name},{element},Alpha Probe,1,1,{season[:4]}-08-15T14:00:00Z,True,90,GK\n"
+               + f"Other Guy,50,Beta Probe,1,1,{season[:4]}-08-15T14:00:00Z,False,90,MID\n")
+        with writer() as conn:
+            conn.execute("INSERT OR IGNORE INTO seasons(id, is_current) VALUES(?, 0)", (season,))
+            archive(conn, "vaastav_history", RawDoc("vaastav_players", raw, external_id=season), None)
+            apply_batch(conn, c.parse(RawDoc("vaastav_gws", gws, external_id=season)))
+
+    first = by_external_id("fpl_element", "2014-15:11")
+    assert first is not None and first == by_external_id("fpl_element", "2015-16:22")
+    assert by_external_id("fpl", "11334") == first

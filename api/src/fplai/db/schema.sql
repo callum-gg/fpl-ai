@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS player_fixture_stats (
     total_points        INTEGER,
     starts              INTEGER,
     xg REAL, xa REAL, npxg REAL, xgot REAL, shots INTEGER, shots_on_target INTEGER,
-    key_passes INTEGER, big_chances INTEGER, big_chances_missed INTEGER,
+    key_passes INTEGER, big_chances INTEGER, big_chances_missed INTEGER, penalties_taken INTEGER,
     touches_in_box INTEGER, progressive_carries INTEGER, sca INTEGER, gca INTEGER,
     tackles INTEGER, interceptions INTEGER, blocks INTEGER, clearances INTEGER, recoveries INTEGER,
     sofascore_rating REAL, whoscored_rating REAL,

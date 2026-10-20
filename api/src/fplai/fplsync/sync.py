@@ -232,11 +232,21 @@ def _purchase_prices(transfers: list, entry_id: int) -> dict[int, int]:
 
 
 def _free_transfers(history: dict, gameweek: int) -> int:
-    """FPL does not expose FT directly on the public API, so derive it from transfers made."""
+    """FPL does not expose FT directly on the public API, so derive it from transfers made.
+
+    Gameweek 1 is skipped deliberately. Changes before the GW1 deadline are squad selection,
+    not transfers: they are unlimited, they are free, and nothing banks out of them — you
+    arrive at GW2 with exactly one free transfer however much you rebuilt. Counting GW1 as
+    a quiet week and banking a second FT out of it made this read 2 for GW2, when the entry
+    had 1 and FPL duly charged -8 for three transfers rather than the -4 the extra would
+    have implied.
+    """
     current = 1
     for gw in sorted(history.get("current", []), key=lambda g: g["event"]):
         if gw["event"] >= gameweek:
             break
+        if gw["event"] == 1:
+            continue
         made = gw.get("event_transfers", 0)
         current = min(5, max(0, current - made) + 1)
     return current
