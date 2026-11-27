@@ -33,7 +33,8 @@ class Resolution:
 def _team_key(name: str | None) -> str | None:
     if not name:
         return None
-    row = query_one("SELECT team_key FROM team_aliases WHERE alias_norm=?", (norm_name(name),))
+    n = norm_name(name.replace("&", " and "))    # ESPN's "Brighton & Hove Albion"
+    row = query_one("SELECT team_key FROM team_aliases WHERE alias_norm=?", (n,))
     return row["team_key"] if row else None
 
 

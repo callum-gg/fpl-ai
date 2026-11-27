@@ -59,7 +59,7 @@ SEED_SOURCES: list[tuple] = [
     ("physioroom", "PhysioRoom", "injury", 0, 1, "https://www.physioroom.com", 10),
     ("rss_news", "News RSS", "news", 0, 1, None, 120),
     ("setpieces", "Set-piece takers", "meta", 0, 1, None, 5),
-    ("euro_fixtures", "European fixtures", "meta", 0, 1, None, 10),
+    ("euro_fixtures", "European fixtures (ESPN)", "meta", 0, 1, "https://site.api.espn.com", 30),
     ("weather", "Open-Meteo", "meta", 0, 1, "https://api.open-meteo.com/v1", 60),
     ("referees", "Referee appointments", "meta", 0, 1, None, 5),
     ("youtube", "YouTube Data API", "video", 1, 1, "https://www.googleapis.com/youtube/v3", 60),
