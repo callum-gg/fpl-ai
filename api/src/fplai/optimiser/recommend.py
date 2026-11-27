@@ -252,9 +252,19 @@ def transfers_already_made(squad_id: int, gameweek: int, current_ids: list[int])
 def free_transfers_remaining(squad_id: int, gameweek: int, state: dict | None) -> int:
     stored = int((state or {}).get("free_transfers", 1) or 0)
     picks = (state or {}).get("picks", [])
-    if (state or {}).get("chip_active") in FREE_TRANSFER_CHIPS:
+    ids = [p["player_id"] for p in picks]
+    chip_free = (state or {}).get("chip_active") in FREE_TRANSFER_CHIPS
+    state_gw = (state or {}).get("gameweek", gameweek)
+    if state_gw < gameweek:
+        # No my-team token, so the newest state is a past week's. Its count is as at that
+        # deadline: settle that week, then bank one per deadline passed. Reading it as-is
+        # planned GW10 on 1 FT when the entry had 2.
+        # A wildcard/free hit week spends nothing and banks nothing (rules.free_transfers_next).
+        spent = 0 if chip_free else transfers_already_made(squad_id, state_gw, ids)
+        return min(5, max(0, stored - spent) + gameweek - state_gw - chip_free)
+    if chip_free:
         return stored  # transfers are free under a wildcard or free hit; nothing is spent
-    used = transfers_already_made(squad_id, gameweek, [p["player_id"] for p in picks])
+    used = transfers_already_made(squad_id, gameweek, ids)
     if used:
         log.info("squad %s GW%s: %d transfer(s) already made, %d free transfer(s) left",
                  squad_id, gameweek, used, max(0, stored - used))
@@ -274,7 +284,7 @@ def _plan_context(
         bank=(state or {}).get("bank", 0),
         free_transfers=free_transfers_remaining(squad_id, gameweek, state),
         chips_used=_chips_used(state),
-        chip_active=(state or {}).get("chip_active"),
+        chip_active=(state or {}).get("chip_active") if (state or {}).get("gameweek") == gameweek else None,
         selling_prices={p["player_id"]: p.get("selling_price") or 0 for p in picks},
         decay=float(settings.get("horizon_decay", 0.84)),
         bench_weight=float(settings.get("bench_weight", 0.12)),
