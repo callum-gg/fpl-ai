@@ -96,7 +96,9 @@ def backfill(
             ("understat", {"seasons": ALL_SEASONS[-4:]}, season),
             ("fbref", {"seasons": ALL_SEASONS[-2:]}, season),
             ("setpieces", {}, season),
-            ("euro_fixtures", {"seasons": ALL_SEASONS[-4:]}, season),
+            # Every season with stored features (2020-21 on): a season without its European
+            # games teaches the minutes model that congested clubs are fully rested.
+            ("euro_fixtures", {"seasons": ALL_SEASONS[-7:]}, season),
             ("weather", {}, season),
             # RSS only reaches back a few days. Historic text is thin and that is fine:
             # text features carry recency weight anyway.

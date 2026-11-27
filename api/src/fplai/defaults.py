@@ -181,6 +181,8 @@ TEAM_ALIASES: dict[str, str] = {
     "sunderland": "Sunderland", "black cats": "Sunderland",
     "spurs": "Spurs", "tottenham": "Spurs", "tottenham hotspur": "Spurs", "thfc": "Spurs",
     "west ham": "West Ham", "west ham united": "West Ham", "hammers": "West Ham",
+    # Not in the PL now, but in Europe 2020-22: without it those fixtures resolved to no one.
+    "leicester": "Leicester", "leicester city": "Leicester", "foxes": "Leicester",
     "wolves": "Wolves", "wolverhampton": "Wolves", "wolverhampton wanderers": "Wolves",
 }
 

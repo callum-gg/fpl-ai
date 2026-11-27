@@ -106,6 +106,14 @@ def test_a_parse_only_replaces_its_own_competition_and_season(clubs):
         (clubs["MCI"], clubs["ARS"])]
 
 
+def test_past_european_entrants_outside_todays_pl_resolve(clubs):
+    """Leicester played Europa/Conference League football in 2020-22; the alias table only
+    held this season's twenty, so every one of those fixtures resolved to no one."""
+    from fplai.resolve.entities import resolve_team
+
+    assert resolve_team("Leicester City") == "Leicester"
+
+
 def test_a_football_data_doc_from_before_espn_parses_to_nothing(clubs):
     _parse("UEL", [_event("1", "2026-11-26T20:00Z", "Sunderland", "Jagiellonia Bialystok", True)])
     legacy = RawDoc("euro_matches", {"code": "CL", "data": {"matches": []}},
