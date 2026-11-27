@@ -24,7 +24,10 @@ class WeatherConnector(Connector):
         fixtures = query(
             "SELECT f.id, f.kickoff_utc, t.stadium_lat lat, t.stadium_lon lon "
             "FROM fixtures f JOIN teams t ON t.id = f.home_team_id "
-            "WHERE f.season_id=? AND f.finished=0 AND f.kickoff_utc IS NOT NULL "
+            # PL only: a European row has no venue (a foreign opponent is stored as the PL
+            # club itself, so it would read the home ground even for away games).
+            "WHERE f.season_id=? AND f.competition='PL' AND f.finished=0 "
+            "AND f.kickoff_utc IS NOT NULL "
             "AND t.stadium_lat IS NOT NULL AND f.kickoff_utc < datetime('now','+14 day')",
             (ctx.season_id,),
         )

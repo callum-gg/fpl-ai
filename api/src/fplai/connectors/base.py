@@ -543,6 +543,8 @@ async def reprocess(connector: Connector, limit: int | None = None, force: bool 
     if not force:
         sql += " AND (parser_version IS NULL OR parser_version < ? OR parse_status != 'ok')"
     params: tuple = (connector.id,) if force else (connector.id, connector.parser_version)
+    # Oldest first: a parse may replace what an earlier doc wrote (euro_fixtures does).
+    sql += " ORDER BY id"
     if limit:
         sql += " LIMIT ?"
         params = (*params, limit)

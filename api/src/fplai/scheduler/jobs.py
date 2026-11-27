@@ -460,7 +460,8 @@ DEFAULT_CADENCE = {
     "transfermarkt": "0 6 * * 3",
     "weather": "0 7 * * *",
     "setpieces": "0 6 * * 3",
-    "euro_fixtures": "0 5 * * 1",
+    # Daily, not Mondays: Thursday's Europa result must land before the weekend deadline.
+    "euro_fixtures": "45 4 * * *",
     "livefpl": "0 */6 * * *",
     "extract_claims": "*/10 * * * *",
     "build_features": "*/30 * * * *",

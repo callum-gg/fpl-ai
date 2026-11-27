@@ -96,7 +96,7 @@ def backfill(
             ("understat", {"seasons": ALL_SEASONS[-4:]}, season),
             ("fbref", {"seasons": ALL_SEASONS[-2:]}, season),
             ("setpieces", {}, season),
-            ("euro_fixtures", {}, season),
+            ("euro_fixtures", {"seasons": ALL_SEASONS[-4:]}, season),
             ("weather", {}, season),
             # RSS only reaches back a few days. Historic text is thin and that is fine:
             # text features carry recency weight anyway.
