@@ -50,9 +50,13 @@ def squad_value(picks: list[dict]) -> int:
 
 
 def free_transfers_next(current_ft: int, transfers_made: int, chip: str | None = None) -> int:
-    """FT accrual with the 5 cap. Wildcard/Free Hit do not consume the banked transfer."""
+    """FT accrual with the 5 cap.
+
+    A Wildcard/Free Hit week keeps the bank but accrues nothing: the owner's entry went
+    GW9 WC on 1 FT -> GW10 1 -> GW11 2. Adding +1 that week read GW11 as 3.
+    """
     if chip in ("wildcard", "freehit"):
-        return min(MAX_FREE_TRANSFERS, current_ft + 1)
+        return current_ft
     remaining = max(0, current_ft - transfers_made)
     return min(MAX_FREE_TRANSFERS, remaining + 1)
 

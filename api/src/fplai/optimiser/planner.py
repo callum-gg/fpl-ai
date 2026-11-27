@@ -219,20 +219,11 @@ def solve_plan(
             # Chip transfers come out of the chip, not the bank — relax the drain
             # under a wildcard/free hit.
             prob += ft[g] <= ft[prev] - used + 1 + BIG_M * free_prev
-            # Always valid, and the only cap on a Free Hit GW (its transfers are
-            # separate, so the bank just accrues +1 as if you'd made no transfers).
             prob += ft[g] <= ft[prev] + 1
-            # A wildcard forfeits banked FTs: you enter the next gameweek with exactly
-            # one. Lower + upper arms pin it — ft only floats where nothing cares.
-            if wc_prev is not None:
-                prob += ft[g] <= 1 + BIG_M * (1 - wc_prev)
-                prob += ft[g] >= wc_prev
-            # A Free Hit leaves the bank untouched. Lower arm preserves (not accrues):
-            # demanding ft[prev]+1 here would demand 6 at a full bank against the cap
-            # of 5 — infeasible. The upper arms still give the +1 (capped) whenever
-            # hit pressure pushes ft up, and the value is exact at the cap.
-            if fh_prev is not None:
-                prob += ft[g] >= ft[prev] - BIG_M * (1 - fh_prev)
+            # A wildcard/free hit week keeps the bank and accrues nothing
+            # (rules.free_transfers_next): pin ft[g] == ft[prev] with both arms.
+            prob += ft[g] <= ft[prev] + BIG_M * (1 - free_prev)
+            prob += ft[g] >= ft[prev] - BIG_M * (1 - free_prev)
             prob += ft[g] <= MAX_FREE_TRANSFERS
 
     # --- personal constraints --------------------------------------------------------

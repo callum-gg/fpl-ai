@@ -19,7 +19,7 @@ from ..connectors.base import fetch_url
 from ..db import settings_store
 from ..db.engine import jdump, query, query_one, utcnow, writer
 from ..resolve.entities import by_external_id
-from ..rules import selling_price
+from ..rules import free_transfers_next, selling_price
 
 log = logging.getLogger(__name__)
 
@@ -241,14 +241,15 @@ def _free_transfers(history: dict, gameweek: int) -> int:
     had 1 and FPL duly charged -8 for three transfers rather than the -4 the extra would
     have implied.
     """
+    chips = {c.get("event"): c.get("name") for c in history.get("chips", [])}
     current = 1
     for gw in sorted(history.get("current", []), key=lambda g: g["event"]):
         if gw["event"] >= gameweek:
             break
         if gw["event"] == 1:
             continue
-        made = gw.get("event_transfers", 0)
-        current = min(5, max(0, current - made) + 1)
+        current = free_transfers_next(current, gw.get("event_transfers", 0),
+                                      chips.get(gw["event"]))
     return current
 
 

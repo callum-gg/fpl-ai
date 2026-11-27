@@ -93,10 +93,10 @@ def _wildcard_ctx(current: list[int], **kw) -> PlanContext:
     return PlanContext(**base)
 
 
-def test_wildcard_transfers_are_free_and_reset_the_bank():
-    """A wildcard rebuild must be hit-free regardless of banked FTs, and must forfeit
-    the bank: you enter the next gameweek with one free transfer — not zero
-    (infeasible), not the drained balance, and not the preserved bank."""
+def test_wildcard_transfers_are_free_and_keep_the_bank():
+    """A wildcard rebuild must be hit-free regardless of banked FTs, and keeps the bank
+    without accruing: you enter the next gameweek on exactly what you banked — not the
+    drained balance, and not +1 (GW11 read 3 FT when the entry had 2)."""
     bad, current = _squad_pool("bad", quality=2.0, id_start=0)
     good, _ = _squad_pool("good", quality=5.0, id_start=1000)   # distinct ids: a real
     # Every GW must offer every candidate — the planner may field anyone in any GW.
@@ -108,7 +108,7 @@ def test_wildcard_transfers_are_free_and_reset_the_bank():
     assert gw1.chip == "wildcard"
     assert gw1.hits == 0                       # WC transfers cost no points
     assert len(gw1.transfers_in) > 2           # rebuild well past the 2 banked FTs
-    assert gw2.free_transfers_in == 1          # reset to one, forfeiting the bank
+    assert gw2.free_transfers_in == 2          # the 2 banked FTs carry, no +1
 
 
 def test_owned_players_missing_from_a_later_gameweek_still_extract():
@@ -148,10 +148,7 @@ def test_free_hit_preserves_a_partial_bank():
     assert plan.status == "optimal"
     gw1, gw2 = plan.gameweeks
     assert gw1.chip == "freehit"
-    # The squad reverts after a FH, so GW2 has no transfer pressure and ft may float
-    # conservatively below its true +1 accrual; it must never exceed the true value
-    # nor drop below the preserved bank.
-    assert 2 <= gw2.free_transfers_in <= 3
+    assert gw2.free_transfers_in == 2          # kept, no +1 for the FH week
 
 
 # ══ free-transfer accounting ═════════════════════════════════════════════════
@@ -222,6 +219,22 @@ def test_a_wildcard_makes_transfers_free_so_none_are_deducted(seeded_season, pla
     a, b, c, d, e = player_pool[:5]
     _seed_two_gameweeks(704, [a, b, c], [a, d, e], stored_ft=2, chip="wildcard")
     assert free_transfers_remaining(704, 2, current_state(704, 2)) == 2
+
+
+def test_planning_from_last_weeks_state_banks_a_free_transfer(seeded_season, player_pool):
+    """No my-team token: plan from last week's state, banking one per deadline passed —
+    except a wildcard week, which banks nothing (GW9 WC on 1 -> GW10 1)."""
+    from fplai.optimiser.recommend import current_state, free_transfers_remaining
+
+    a, b, c, d = player_pool[:4]
+    _seed_two_gameweeks(706, [a, b, c], [a, d, c], stored_ft=1, chip="wildcard")
+    assert free_transfers_remaining(706, 3, current_state(706, 2)) == 1   # WC: no spend, no +1
+
+    _seed_two_gameweeks(707, [a, b, c], [a, d, c], stored_ft=1)
+    assert free_transfers_remaining(707, 3, current_state(707, 2)) == 1   # used it, one banked
+
+    _seed_two_gameweeks(708, [a, b, c], [a, b, c], stored_ft=5)
+    assert free_transfers_remaining(708, 3, current_state(708, 2)) == 5   # capped
 
 
 def test_gameweek_one_has_no_previous_squad_to_diff_against(seeded_season, player_pool):

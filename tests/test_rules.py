@@ -88,7 +88,19 @@ def test_hit_cost_uses_three_when_you_had_two():
 def test_wildcard_and_free_hit_make_transfers_free():
     assert hit_cost(1, 12, chip="wildcard") == 0
     assert hit_cost(1, 12, chip="freehit") == 0
-    assert free_transfers_next(2, 12, chip="wildcard") == 3
+    assert free_transfers_next(2, 12, chip="wildcard") == 2   # bank kept, no +1
+    assert free_transfers_next(5, 0, chip="freehit") == 5
+
+
+def test_sync_ft_matches_the_owners_wildcard_season():
+    """Real entry 6756292: GW9 WC on 1 FT -> GW10 1 -> GW11 2 (not 3) -> GW12 1."""
+    from fplai.fplsync.sync import _free_transfers
+
+    made = {2: 3, 3: 1, 4: 1, 5: 1, 6: 1, 7: 2, 8: 1, 9: 0, 10: 0, 11: 2}
+    history = {"current": [{"event": g, "event_transfers": made.get(g, 0)} for g in range(1, 12)],
+               "chips": [{"name": "3xc", "event": 7}, {"name": "wildcard", "event": 9},
+                         {"name": "bboost", "event": 11}]}
+    assert [_free_transfers(history, g) for g in (10, 11, 12)] == [1, 2, 1]
 
 
 # ── chips ─────────────────────────────────────────────────────────────────────
